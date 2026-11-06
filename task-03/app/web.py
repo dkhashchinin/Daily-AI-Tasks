@@ -20,7 +20,13 @@ HTML = r"""<!doctype html>
   body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
          background: radial-gradient(1200px 600px at 20% -10%, #1e293b, #0b1120 60%); color:#e2e8f0; height:100vh;
          display:flex; }
-  .shell { margin:0 auto; width:100%; max-width:920px; height:100%; display:flex; flex-direction:column; }
+  .app { width:100%; height:100%; display:flex; }
+  .sidebar { width:290px; flex:0 0 290px; padding:18px 18px 22px; display:flex; flex-direction:column; gap:14px;
+             background:rgba(15,23,42,.55); border-right:1px solid rgba(255,255,255,.08); backdrop-filter:blur(6px);
+             overflow-y:auto; }
+  .sidebar h2 { font-size:11px; text-transform:uppercase; letter-spacing:.8px; color:#94a3b8; margin:0 0 2px; padding-bottom:10px;
+                border-bottom:1px solid rgba(255,255,255,.08); }
+  .main { flex:1; min-width:0; display:flex; flex-direction:column; }
   header { padding:16px 20px; display:flex; align-items:center; gap:12px;
            background:rgba(15,23,42,.5); border-bottom:1px solid rgba(255,255,255,.08); backdrop-filter:blur(6px); }
   header .logo { width:30px; height:30px; border-radius:9px; display:grid; place-items:center;
@@ -64,15 +70,15 @@ HTML = r"""<!doctype html>
   .typing .t-dot:nth-child(2){ animation-delay:.2s; }
   .typing .t-dot:nth-child(3){ animation-delay:.4s; }
   @keyframes blink { 0%,80%,100%{ opacity:.2; transform:scale(1); } 40%{ opacity:1; transform:scale(1.15); } }
-  .settings { display:flex; gap:10px; align-items:center; flex-wrap:wrap; padding:12px 20px 8px;
-              background:rgba(15,23,42,.5); border-top:1px solid rgba(255,255,255,.08); backdrop-filter:blur(6px); }
-  .settings label { font-size:12px; color:#94a3b8; white-space:nowrap; }
-  .settings input, .settings select { flex:1; max-width:320px; padding:9px 12px; border-radius:10px; font-size:13px;
+  .field { display:flex; flex-direction:column; gap:6px; }
+  .field label { font-size:12px; color:#94a3b8; }
+  .field input, .field select { width:100%; padding:9px 12px; border-radius:10px; font-size:13px;
                background:rgba(255,255,255,.04); color:#e2e8f0; border:1px solid rgba(255,255,255,.12); outline:none; transition:.15s; }
-  .settings input:focus, .settings select:focus { border-color:#2563eb; background:rgba(255,255,255,.07); }
-  .settings select option { background:#0f172a; color:#e2e8f0; }
-  .settings input.num { max-width:90px; flex:0 0 90px; }
-  .settings input.wide, .settings select { flex:1 1 300px; max-width:none; }
+  .field input:focus, .field select:focus { border-color:#2563eb; background:rgba(255,255,255,.07); }
+  .field select option { background:#0f172a; color:#e2e8f0; }
+  .hint { font-size:11px; color:#94a3b8; padding:6px 9px; border-radius:8px; line-height:1.4;
+          border:1px solid transparent; transition:.15s; }
+  .hint.show { background:rgba(37,99,235,.12); color:#93c5fd; border-color:rgba(37,99,235,.35); }
   form { display:flex; gap:10px; padding:14px 20px 18px; background:rgba(15,23,42,.5);
          border-top:1px solid rgba(255,255,255,.08); backdrop-filter:blur(6px); }
   #msg { flex:1; padding:13px 15px; border-radius:13px; border:1px solid rgba(255,255,255,.12);
@@ -87,7 +93,57 @@ HTML = r"""<!doctype html>
 </style>
 </head>
 <body>
-<div class="shell">
+<div class="app">
+<aside class="sidebar">
+  <h2>Параметры</h2>
+  <div class="field">
+    <label for="max_tokens">max_tokens</label>
+    <input id="max_tokens" type="number" min="1" max="8192" placeholder="1024">
+  </div>
+  <div class="field">
+    <label for="max_completion_tokens">max_completion_tokens</label>
+    <select id="max_completion_tokens">
+      <option value="">не задано</option>
+      <option value="256">256 — краткий ответ</option>
+      <option value="512">512 — беседа</option>
+      <option value="1024">1024 — стандарт</option>
+      <option value="2048">2048 — средняя сложность</option>
+      <option value="4096">4096 — анализ/код</option>
+      <option value="8192">8192 — максимум</option>
+    </select>
+    <div class="hint" id="max_completion_tokens_hint"></div>
+  </div>
+  <div class="field">
+    <label for="budget_tokens">budget_tokens</label>
+    <input id="budget_tokens" type="number" min="1" placeholder="лимит рассуждений">
+  </div>
+  <div class="field">
+    <label for="stop">stop_sequence</label>
+    <input id="stop" placeholder="стоп-фразы">
+  </div>
+  <div class="field">
+    <label for="response_format">формат ответа</label>
+    <select id="response_format">
+      <option value="">не задано</option>
+      <option value="Обычный текст">Обычный текст</option>
+      <option value="Markdown с заголовками и списками">Markdown</option>
+      <option value="JSON объект без пояснений">JSON объект</option>
+      <option value="JSON с полями answer и reason">JSON: answer/reason</option>
+      <option value="Маркированный список">Маркированный список</option>
+      <option value="CSV: первая строка — заголовки полей">CSV</option>
+    </select>
+  </div>
+  <div class="field">
+    <label for="reasoning_effort">reasoning.effort</label>
+    <select id="reasoning_effort">
+      <option value="">не задано</option>
+      <option value="low">low</option>
+      <option value="medium">medium</option>
+      <option value="high">high</option>
+    </select>
+  </div>
+</aside>
+<div class="main">
 <header>
   <span class="logo">
     <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -98,46 +154,61 @@ HTML = r"""<!doctype html>
   <span class="model">{{ model }}</span>
 </header>
 <div id="chat">
-  <div class="row assistant"><div class="bubble">Привет! Задай вопрос и при желании настрой параметры выше.</div></div>
-</div>
-<div class="settings">
-  <label for="max_tokens">max_tokens</label>
-  <input id="max_tokens" class="num" type="number" min="1" max="8192" placeholder="1024">
-  <label for="stop">stop_sequence</label>
-  <input id="stop" placeholder="стоп-фразы">
-  <label for="response_format">формат ответа</label>
-  <select id="response_format">
-    <option value="">не задано</option>
-    <option value="Обычный текст">Обычный текст</option>
-    <option value="Markdown с заголовками и списками">Markdown</option>
-    <option value="JSON объект без пояснений">JSON объект</option>
-    <option value="JSON с полями answer и reason">JSON: answer/reason</option>
-    <option value="Маркированный список">Маркированный список</option>
-    <option value="CSV: первая строка — заголовки полей">CSV</option>
-  </select>
+  <div class="row assistant"><div class="bubble">Привет! Задай вопрос и при желании настрой параметры слева.</div></div>
 </div>
 <form id="chat-form">
   <input id="msg" placeholder="Введите сообщение..." autocomplete="off">
   <button id="send" type="submit">Отправить</button>
 </form>
 </div>
+</div>
 <script>
 const chat = document.getElementById('chat');
 const input = document.getElementById('msg');
 const maxTokensInput = document.getElementById('max_tokens');
+const maxCompInput = document.getElementById('max_completion_tokens');
+const maxCompHint = document.getElementById('max_completion_tokens_hint');
+const budgetInput = document.getElementById('budget_tokens');
 const stopInput = document.getElementById('stop');
 const formatInput = document.getElementById('response_format');
+const effortInput = document.getElementById('reasoning_effort');
 const sendBtn = document.getElementById('send');
 let busy = false;
+
+const MAX_COMP_HINTS = {
+  '256':  'Короткий ответ с минимумом рассуждений.',
+  '512':  'Обычная беседа, лёгкая задача.',
+  '1024': 'Стандартный объём (дефолт).',
+  '2048': 'Задачи средней сложности с рассуждениями.',
+  '4096': 'Сложный анализ / генерация кода.',
+  '8192': 'Максимум (если модель позволяет).',
+};
+function updateMaxCompHint(){
+  const v = maxCompInput.value;
+  if (v && MAX_COMP_HINTS[v]){
+    maxCompHint.textContent = MAX_COMP_HINTS[v];
+    maxCompHint.classList.add('show');
+  } else {
+    maxCompHint.textContent = '';
+    maxCompHint.classList.remove('show');
+  }
+}
+maxCompInput.addEventListener('change', updateMaxCompHint);
 
 function collectParams(){
   const mt = parseInt(maxTokensInput.value, 10);
   const body = {};
   if (mt && mt > 0) body.max_tokens = mt;
+  const mc = parseInt(maxCompInput.value, 10);
+  if (mc && mc > 0) body.max_completion_tokens = mc;
+  const bt = parseInt(budgetInput.value, 10);
+  if (bt && bt > 0) body.budget_tokens = bt;
   const stops = stopInput.value.split(',').map(s => s.trim()).filter(Boolean);
   if (stops.length) body.stop = stops.length === 1 ? stops[0] : stops;
   const fmt = formatInput.value.trim();
   if (fmt) body.response_format = fmt;
+  const eff = effortInput.value.trim();
+  if (eff) body.reasoning_effort = eff;
   return body;
 }
 
@@ -308,7 +379,21 @@ def _load_params(data: dict) -> tuple:
                 max_tokens = None
         except (TypeError, ValueError):
             max_tokens = None
-    return max_tokens, stop
+    reasoning_effort = (data.get("reasoning_effort") or "").strip() or None
+
+    def _int_arg(key: str):
+        val = data.get(key)
+        if val is None:
+            return None
+        try:
+            val = int(val)
+            return val if val > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    max_completion_tokens = _int_arg("max_completion_tokens")
+    budget_tokens = _int_arg("budget_tokens")
+    return max_tokens, stop, reasoning_effort, max_completion_tokens, budget_tokens
 
 
 def _build_messages(data: dict) -> list[dict]:
@@ -323,9 +408,11 @@ def _build_messages(data: dict) -> list[dict]:
 @app.route("/chat", methods=["POST"])
 def chat_endpoint():
     data = request.get_json()
-    max_tokens, stop = _load_params(data)
+    max_tokens, stop, reasoning_effort, max_completion_tokens, budget_tokens = _load_params(data)
     try:
-        reply = chat(_build_messages(data), max_tokens=max_tokens, stop=stop)
+        reply = chat(_build_messages(data), max_tokens=max_tokens, stop=stop,
+                     reasoning_effort=reasoning_effort,
+                     max_completion_tokens=max_completion_tokens, budget_tokens=budget_tokens)
         return jsonify({"reply": reply, "metrics": last(), "error": None})
     except Exception as exc:
         return jsonify({"reply": None, "metrics": last(), "error": str(exc)})
@@ -334,7 +421,7 @@ def chat_endpoint():
 @app.route("/chat/stream", methods=["POST"])
 def chat_stream_endpoint():
     data = request.get_json()
-    max_tokens, stop = _load_params(data)
+    max_tokens, stop, reasoning_effort, max_completion_tokens, budget_tokens = _load_params(data)
     messages = _build_messages(data)
 
     stop_active = bool(stop)
@@ -343,7 +430,10 @@ def chat_stream_endpoint():
         produced = False
         finish_reason = None
         try:
-            for kind, text in stream_chat(messages, max_tokens=max_tokens, stop=stop):
+            for kind, text in stream_chat(messages, max_tokens=max_tokens, stop=stop,
+                                          reasoning_effort=reasoning_effort,
+                                          max_completion_tokens=max_completion_tokens,
+                                          budget_tokens=budget_tokens):
                 if kind == "content":
                     produced = True
                 elif kind == "finish":
