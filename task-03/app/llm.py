@@ -7,8 +7,8 @@ from .config import PARAMS, MODEL, get_client_config
 from .metrics import record
 
 
-def get_client() -> OpenAI:
-    return OpenAI(**get_client_config())
+def get_client(model: str | None = None) -> OpenAI:
+    return OpenAI(**get_client_config(model))
 
 
 def build_params(max_tokens: int | None = None, stop: str | list[str] | None = None,
@@ -31,18 +31,20 @@ def build_params(max_tokens: int | None = None, stop: str | list[str] | None = N
     return params
 
 
-def chat(messages: list[dict], *, max_tokens: int | None = None,
+def chat(messages: list[dict], *, model: str | None = None,
+         max_tokens: int | None = None,
          stop: str | list[str] | None = None,
          reasoning_effort: str | None = None,
          max_completion_tokens: int | None = None,
          budget_tokens: int | None = None) -> str:
     """Send a chat request and return the assistant's reply."""
-    client = get_client()
+    model = model or MODEL
+    client = get_client(model)
     start = time.perf_counter()
     response = client.chat.completions.create(
         **build_params(max_tokens, stop, reasoning_effort,
                        max_completion_tokens, budget_tokens),
-        model=MODEL,
+        model=model,
         messages=messages,
     )
     elapsed = time.perf_counter() - start
@@ -56,7 +58,7 @@ def chat(messages: list[dict], *, max_tokens: int | None = None,
             "total_tokens": getattr(u, "total_tokens", None),
         }
     record(
-        response_model=MODEL,
+        response_model=model,
         usage=usage,
         elapsed=elapsed,
         message_count=len(messages),
@@ -64,7 +66,8 @@ def chat(messages: list[dict], *, max_tokens: int | None = None,
     return response.choices[0].message.content
 
 
-def stream_chat(messages: list[dict], *, max_tokens: int | None = None,
+def stream_chat(messages: list[dict], *, model: str | None = None,
+                max_tokens: int | None = None,
                 stop: str | list[str] | None = None,
                 reasoning_effort: str | None = None,
                 max_completion_tokens: int | None = None,
@@ -75,12 +78,13 @@ def stream_chat(messages: list[dict], *, max_tokens: int | None = None,
     (the model's chain-of-thought) or ``"content"`` (the final answer).
     Metrics are recorded once the stream finishes.
     """
-    client = get_client()
+    model = model or MODEL
+    client = get_client(model)
     start = time.perf_counter()
     stream = client.chat.completions.create(
         **build_params(max_tokens, stop, reasoning_effort,
                        max_completion_tokens, budget_tokens),
-        model=MODEL,
+        model=model,
         messages=messages,
         stream=True,
         stream_options={"include_usage": True},
@@ -109,7 +113,7 @@ def stream_chat(messages: list[dict], *, max_tokens: int | None = None,
             yield ("content", content)
 
     record(
-        response_model=MODEL,
+        response_model=model,
         usage=usage,
         elapsed=time.perf_counter() - start,
         message_count=len(messages),
