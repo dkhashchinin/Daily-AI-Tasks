@@ -14,7 +14,8 @@ def get_client(model: str | None = None) -> OpenAI:
 def build_params(max_tokens: int | None = None, stop: str | list[str] | None = None,
                  reasoning_effort: str | None = None,
                  max_completion_tokens: int | None = None,
-                 budget_tokens: int | None = None) -> dict:
+                 budget_tokens: int | None = None,
+                 temperature: float | None = None) -> dict:
     """Merge per-request overrides into the base PARAMS."""
     params = dict(PARAMS)
     if max_tokens is not None:
@@ -28,6 +29,8 @@ def build_params(max_tokens: int | None = None, stop: str | list[str] | None = N
         params["max_completion_tokens"] = max_completion_tokens
     if budget_tokens is not None:
         params["extra_body"] = {"budget_tokens": budget_tokens}
+    if temperature is not None:
+        params["temperature"] = temperature
     return params
 
 
@@ -36,14 +39,15 @@ def chat(messages: list[dict], *, model: str | None = None,
          stop: str | list[str] | None = None,
          reasoning_effort: str | None = None,
          max_completion_tokens: int | None = None,
-         budget_tokens: int | None = None) -> str:
+         budget_tokens: int | None = None,
+         temperature: float | None = None) -> str:
     """Send a chat request and return the assistant's reply."""
     model = model or MODEL
     client = get_client(model)
     start = time.perf_counter()
     response = client.chat.completions.create(
         **build_params(max_tokens, stop, reasoning_effort,
-                       max_completion_tokens, budget_tokens),
+                       max_completion_tokens, budget_tokens, temperature),
         model=model,
         messages=messages,
     )
@@ -71,7 +75,8 @@ def stream_chat(messages: list[dict], *, model: str | None = None,
                 stop: str | list[str] | None = None,
                 reasoning_effort: str | None = None,
                 max_completion_tokens: int | None = None,
-                budget_tokens: int | None = None):
+                budget_tokens: int | None = None,
+                temperature: float | None = None):
     """Stream a chat completion.
 
     Yields ``(kind, text)`` pairs where ``kind`` is either ``"reasoning"``
@@ -83,7 +88,7 @@ def stream_chat(messages: list[dict], *, model: str | None = None,
     start = time.perf_counter()
     stream = client.chat.completions.create(
         **build_params(max_tokens, stop, reasoning_effort,
-                       max_completion_tokens, budget_tokens),
+                       max_completion_tokens, budget_tokens, temperature),
         model=model,
         messages=messages,
         stream=True,

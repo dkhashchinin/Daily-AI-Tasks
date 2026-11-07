@@ -1,6 +1,7 @@
 """Minimal Flask web interface for chatting with the LLM (streaming)."""
 import ast
 import json
+import re
 import time
 
 from flask import Flask, Response, jsonify, render_template_string, request
@@ -12,16 +13,11 @@ from .tasks import TASKS, by_id
 
 app = Flask(__name__)
 
-# Prompting techniques compared in the "Day 3" experiment (label -> extra instruction).
-COMPARE_METHODS = [
-    ("Прямой ответ", ""),
-    ("Пошагово", "решай пошагово"),
-    ("Промпт", "Сначала составь подробный промпт для решения этой задачи, а затем используй его для решения."),
-    ("Эксперты", "Сформируй группу экспертов (аналитик, инженер, критик) и предоставь решение от каждого по отдельности."),
-]
+# Temperatures compared in the "experiment": each task is run at each of these values.
+TEMPERATURES: list[float] = [0, 0.7, 1.2]
 
-# Reasoning settings compared: (label, reasoning_effort value).
-REASONING_SETTINGS = [("low", "low"), ("high", "high")]
+# Number of sequential runs per (task, temperature) pair.
+RUNS_PER_CELL: int = 5
 
 HTML = r"""<!doctype html>
 <html lang="ru">
@@ -192,6 +188,10 @@ HTML = r"""<!doctype html>
       <option value="high">high</option>
     </select>
   </div>
+  <div class="field">
+    <label for="temperature">temperature</label>
+    <input id="temperature" type="number" min="0" max="2" step="0.1" placeholder="1.0">
+  </div>
 </aside>
 <div class="main">
 <header>
@@ -218,7 +218,7 @@ HTML = r"""<!doctype html>
   <div class="sendrow">
     <input id="msg" placeholder="Введите задачу..." autocomplete="off">
     <button id="send" type="submit">Отправить</button>
-    <button id="stop" type="button" style="display:none">Стоп</button>
+    <button id="stop-btn" type="button" style="display:none">Стоп</button>
   </div>
 </form>
 </div>
@@ -235,8 +235,9 @@ const budgetInput = document.getElementById('budget_tokens');
 const stopInput = document.getElementById('stop');
 const formatInput = document.getElementById('response_format');
 const effortInput = document.getElementById('reasoning_effort');
+const temperatureInput = document.getElementById('temperature');
 const sendBtn = document.getElementById('send');
-const stopBtn = document.getElementById('stop');
+const stopBtn = document.getElementById('stop-btn');
 const presetBtns = document.querySelectorAll('.preset');
 let busy = false;
 let currentCtrl = null;
@@ -261,8 +262,6 @@ taskInput.addEventListener('change', () => {
 modelInput.addEventListener('change', () => {
   document.getElementById('model-badge').textContent = modelInput.value;
 });
-
-const COMPARE = {{ compare_methods|tojson }};
 
 function esc(s){
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -298,6 +297,8 @@ function collectParams(){
   if (fmt) body.response_format = fmt;
   const eff = effortInput.value.trim();
   if (eff) body.reasoning_effort = eff;
+  const temp = temperatureInput.value.trim();
+  if (temp && !isNaN(parseFloat(temp))) body.temperature = parseFloat(temp);
   return body;
 }
 
@@ -398,7 +399,7 @@ function fmt(metrics){
 
 async function runStream(asst, payload){
   let gotContent = false;
-  const res = { metrics: null, finish_reason: null, empty: false, stopped_by_stop: false, stopped: false, correct: null };
+  const res = { metrics: null, finish_reason: null, empty: false, stopped_by_stop: false, stopped: false, correct: null, format_ok: null };
   const ctrl = new AbortController();
   currentCtrl = ctrl;
   try {
@@ -431,6 +432,7 @@ async function runStream(asst, payload){
             res.empty = d.empty;
             res.stopped_by_stop = d.stopped_by_stop;
             res.correct = d.correct === undefined ? null : d.correct;
+            res.format_ok = d.format_ok === undefined ? null : d.format_ok;
             if (d.metrics && d.metrics.model) {
               document.getElementById('model-badge').textContent = d.metrics.model;
             }
@@ -455,24 +457,68 @@ async function runStream(asst, payload){
   return res;
 }
 
-function renderCompareTable(rows){
+function tokensOf(r){ return r.tokens == null ? '—' : String(r.tokens); }
+function timeOf(r){ return r.time == null ? '—' : (r.time + ' мс'); }
+
+function norm(s){ return String(s).toLowerCase().replace(/[^a-zа-яё0-9 ]/gi, ' ').split(/\s+/).filter(Boolean); }
+function setSim(a, b){
+  const A = new Set(norm(a)), B = new Set(norm(b));
+  if (!A.size && !B.size) return a === b ? 1 : 0;
+  let inter = 0; A.forEach(x => { if (B.has(x)) inter++; });
+  const union = A.size + B.size - inter;
+  return union ? inter / union : 0;
+}
+function avgSimilarity(rows){
+  let sum = 0, cnt = 0;
+  for (let i = 0; i < rows.length; i++)
+    for (let j = i + 1; j < rows.length; j++){ sum += setSim(rows[i].answer, rows[j].answer); cnt++; }
+  return cnt ? sum / cnt : 0;
+}
+function distinctCount(rows){
+  return new Set(rows.map(r => norm(r.answer).join(' '))).size;
+}
+
+function renderCompareAnalysis(rows, temperature){
   const row = document.createElement('div'); row.className = 'row assistant';
   const b = document.createElement('div'); b.className = 'bubble cmp';
-  let html = '<div class="cap">Сравнение</div><table class="cmp-table">'
-           + '<tr><th>способ</th><th>reasoning_effort</th><th>токены</th><th>время</th><th>ответ</th></tr>';
-  for (const r of rows){
-    const tokens = r.tokens == null ? '—' : String(r.tokens);
-    const time = r.time == null ? '—' : (r.time + ' мс');
+  const sim = Math.round(avgSimilarity(rows) * 100);
+  const distinct = distinctCount(rows);
+  const total = rows.length;
+  const brokenFormat = rows.filter(r => r.formatOk === false).length;
+  const wrongAnswer = rows.filter(r => r.correct === false).length;
+  const brokenRuns = rows.filter(r => r.formatOk === false || r.correct === false).length;
+  const hasTask = rows.some(r => r.correct !== null || r.formatOk !== null);
+
+  let html = '<div class="cap">Сравнение · ' + total + ' прогонов</div>'
+           + '<div class="verd-sum">'
+           + '<div class="line">temperature: <b>' + temperature + '</b></div>'
+           + '<div class="line">Уникальных ответов: <b>' + distinct + ' из ' + total + '</b></div>'
+           + '<div class="line">Средняя попарная схожесть ответов: <b>' + sim + '%</b></div>'
+           + (hasTask
+              ? '<div class="line">Сломанный формат: <b>' + brokenFormat + ' из ' + total + '</b></div>'
+                + '<div class="line">Неверный ответ: <b>' + wrongAnswer + ' из ' + total + '</b></div>'
+                + '<div class="line">Прогонов с проблемой (формат или ответ): <b>' + brokenRuns + ' из ' + total + '</b></div>'
+              : '<div class="line" style="color:#64748b">Выберите задачу, чтобы проверить формат и правильность ответа.</div>')
+           + '</div>';
+
+  html += '<table class="cmp-table">'
+         + '<tr><th>№</th><th>ответ</th><th>формат</th><th>верно</th><th>токены</th><th>время</th></tr>';
+  rows.forEach((r, i) => {
     const ans = r.answer == null ? '' : String(r.answer);
     const shortAns = ans.length > 160 ? ans.slice(0, 150) + '…' : ans;
     const title = ans ? ' title="' + esc(ans.slice(0, 500)) + '"' : '';
-    let mark = '';
-    if (r.correct === true) mark = ' <span class="badge ok">✓ верно</span>';
-    else if (r.correct === false) mark = ' <span class="badge bad">✗ неверно</span>';
-    html += '<tr><td>' + esc(r.label) + '</td><td>' + esc(r.effort || '—') + '</td>'
-          + '<td class="num">' + tokens + '</td><td class="num">' + time + '</td>'
-          + '<td' + title + '>' + (shortAns ? esc(shortAns) : '—') + mark + '</td></tr>';
-  }
+    let fmtMark = '';
+    if (r.formatOk === true) fmtMark = ' <span class="badge ok">✓</span>';
+    else if (r.formatOk === false) fmtMark = ' <span class="badge bad">✗</span>';
+    let corMark = '';
+    if (r.correct === true) corMark = ' <span class="badge ok">✓ верно</span>';
+    else if (r.correct === false) corMark = ' <span class="badge bad">✗ неверно</span>';
+    else if (r.correct === null) corMark = ' <span class="badge" style="color:#94a3b8">n/a</span>';
+    html += '<tr><td class="num">' + (i + 1) + '</td>'
+          + '<td' + title + '>' + (shortAns ? esc(shortAns) : '—') + '</td>'
+          + '<td>' + fmtMark + '</td><td>' + corMark + '</td>'
+          + '<td class="num">' + tokensOf(r) + '</td><td class="num">' + timeOf(r) + '</td></tr>';
+  });
   html += '</table>';
   b.innerHTML = html;
   row.appendChild(b); chat.appendChild(row); scroll();
@@ -484,28 +530,29 @@ async function runCompare(){
   if (!m) return;
   input.value = '';
   addUser(m);
+  setBusy(true); showTyping();
+  const RUNS = 5;
   const rows = [];
-  const effort = (effortInput.value.trim() || '—');
   try {
-    for (const item of COMPARE){
-      setBusy(true); showTyping();
-      const asst = addAssistant(item.label);
-      const payload = Object.assign({ message: m, instruction: item.instr }, collectParams());
+    for (let i = 1; i <= RUNS; i++){
+      const asst = addAssistant('Прогон ' + i);
+      const payload = Object.assign({ message: m }, collectParams());
       const res = await runStream(asst, payload);
       hideTyping();
       const u = res.metrics && res.metrics.usage;
       rows.push({
-        label: item.label,
-        effort: effort,
         answer: asst.ans.textContent || '',
         correct: res.correct,
+        formatOk: res.format_ok,
         tokens: u && u.total_tokens != null ? u.total_tokens : null,
         time: res.metrics && res.metrics.latency_ms != null ? res.metrics.latency_ms : null,
       });
       const s = fmt(res.metrics);
       if (s) { asst.meta.textContent = 'metrics: ' + s; asst.meta.style.display = 'block'; }
     }
-    renderCompareTable(rows);
+    const tv = temperatureInput.value.trim();
+    const temperature = (tv !== '' && !isNaN(parseFloat(tv))) ? parseFloat(tv) : 1;
+    renderCompareAnalysis(rows, temperature);
   } finally {
     hideTyping();
     setBusy(false); input.focus();
@@ -565,67 +612,59 @@ async function runExperimentStream(asst, payload){
 function renderExperiment(asst, rows, verdict){
   const b = document.createElement('div'); b.className = 'bubble cmp';
   const wrap = document.createElement('div'); wrap.className = 'expwrap';
-  const cells = {}, settings = [], methods = [];
-  const totals = {};
-  rows.forEach(r => {
-    if (!cells[r.method]) cells[r.method] = {};
-    cells[r.method][r.setting] = r;
-    if (!settings.includes(r.setting)) settings.push(r.setting);
-    if (!methods.includes(r.method)) methods.push(r.method);
-    totals[r.setting] = totals[r.setting] || { correct: 0, tasks: 0, tokens: 0, time: 0 };
-    const t = totals[r.setting];
-    t.correct += r.correct; t.tasks += r.total; t.tokens += r.tokens || 0; t.time += r.time;
-  });
 
-  let html = '<div class="cap">Эксперимент · способ × рассуждение</div>'
-           + '<div class="verd-sum"><b>Рассуждение:</b> «low» = минимум, «high» = максимум '
-           + '(параметр reasoning_effort). Столбцы ниже считаются для каждой настройки отдельно.</div>';
+  let html = '<div class="cap">Эксперимент · temperature × задачи · 5 прогонов на пару</div>';
+
   html += '<table class="cmp-table">';
-  html += '<tr><th rowspan="2">Способ</th>';
-  settings.forEach(s => { html += '<th colspan="3" class="grp">рассуждение (effort): «' + esc(s) + '»</th>'; });
-  html += '</tr>';
-  html += '<tr>';
-  settings.forEach(() => { html += '<th class="sub">верных</th><th class="sub num">токены</th><th class="sub num">время, с</th>'; });
-  html += '</tr>';
+  html += '<tr class="grp"><th colspan="9" class="grp">temperature × задача</th></tr>';
+  html += '<tr><th>задача</th><th>temperature</th><th>уникальных</th><th>схожесть</th>'
+        + '<th>верно/формат</th><th>проблем.</th><th>токены</th><th>время, с</th><th>пример ответа</th></tr>';
 
-  methods.forEach(m => {
-    html += '<tr><td>' + esc(m) + '</td>';
-    settings.forEach(s => {
-      const r = cells[m][s];
-      if (!r) { html += '<td class="num">—</td><td class="num">—</td><td class="num">—</td>'; return; }
-      let mark = '';
-      if (r.correct === r.total && r.total > 0) mark = ' <span class="badge ok" title="все задачи решены верно">✓</span>';
-      else if (r.correct === 0) mark = ' <span class="badge bad" title="ни одной задачи решено верно">✗</span>';
-      html += '<td class="num">' + r.correct + '/' + r.total + mark + '</td>'
-            + '<td class="num">' + (r.tokens || 0) + '</td>'
-            + '<td class="num">' + r.time.toFixed(1) + '</td>';
-    });
-    html += '</tr>';
+  let lastTask = null, lastKind = null;
+  rows.forEach(r => {
+    if (lastTask !== r.task_id){
+      if (lastTask !== null){
+        html += '<tr class="totals"><td colspan="9"></td></tr>';
+      }
+      lastTask = r.task_id; lastKind = r.kind;
+      html += '<tr><th class="grp" colspan="9">«' + esc(r.task_title) + '»</th></tr>';
+    }
+    const n = r.runs.length;
+    const quality = lastKind === 'numeric'
+      ? ('верно <b>' + r.correct + '/' + n + '</b>')
+      : ('формат <b>' + r.format_ok + '/' + n + '</b>');
+    let mark = '';
+    if (r.broken === 0) mark = ' <span class="badge ok">✓</span>';
+    else if (r.broken === n) mark = ' <span class="badge bad">✗</span>';
+    let ex = '';
+    let exTitle = '';
+    const first = r.runs && r.runs.length ? r.runs[0].answer : '';
+    if (first){
+      ex = first.length > 70 ? first.slice(0, 67) + '…' : first;
+      exTitle = ' title="' + esc(first.slice(0, 400)) + '"';
+      ex = '<span' + exTitle + '>' + esc(ex) + '</span>';
+    } else {
+      ex = '—';
+    }
+    html += '<tr>'
+          + '<td>' + (lastKind === 'numeric' ? 'числовая' : 'генерация') + '</td>'
+          + '<td class="num">' + r.temp + '</td>'
+          + '<td class="num">' + r.distinct + '/' + n + '</td>'
+          + '<td class="num">' + r.similarity + '%</td>'
+          + '<td>' + quality + mark + '</td>'
+          + '<td class="num">' + r.broken + '</td>'
+          + '<td class="num">' + (r.tokens || 0) + '</td>'
+          + '<td class="num">' + r.time_s.toFixed(1) + '</td>'
+          + '<td>' + ex + '</td>'
+          + '</tr>';
   });
-
-  html += '<tr class="totals"><td>итого</td>';
-  settings.forEach(s => {
-    const t = totals[s];
-    const pct = t.tasks ? Math.round(100 * t.correct / t.tasks) : 0;
-    html += '<td class="num">' + t.correct + '/' + t.tasks + ' (' + pct + '%)</td>'
-          + '<td class="num">' + t.tokens + '</td>'
-          + '<td class="num">' + t.time.toFixed(1) + '</td>';
-  });
-  html += '</tr>';
   html += '</table>';
 
-  html += '<div class="verd-sum">';
-  settings.forEach(s => {
-    const t = totals[s];
-    html += '<div class="line">«' + esc(s) + '»: верных <b>' + t.correct + '/' + t.tasks + '</b>, '
-          + 'токены <b>' + t.tokens + '</b>, время <b>' + t.time.toFixed(1) + ' с</b> ('
-          + (t.tasks ? (t.tokens / t.tasks).toFixed(0) : 0) + ' токенов/задачу)</div>';
-  });
-  html += '</div>';
-
   if (verdict && verdict.length) {
-    html += '<div class="verdict-title">Вывод</div>';
-    verdict.forEach(line => { html += '<div class="note verdict">' + esc(line) + '</div>'; });
+    verdict.forEach(sec => {
+      html += '<div class="verdict-title">' + esc(sec.title || 'Вывод') + '</div>';
+      (sec.lines || []).forEach(line => { html += '<div class="note verdict">' + esc(line) + '</div>'; });
+    });
   }
   wrap.innerHTML = html;
   b.appendChild(wrap);
@@ -666,10 +705,9 @@ document.getElementById('chat-form').addEventListener('submit', async function (
 @app.route("/")
 def index():
     tasks_view = [{"id": t.id, "title": t.title, "prompt": t.prompt} for t in TASKS]
-    compare_methods = [{"label": l, "instr": i} for l, i in COMPARE_METHODS]
     response = app.make_response(
         render_template_string(HTML, model=MODELS[0], models=MODELS,
-                               tasks_view=tasks_view, compare_methods=compare_methods)
+                               tasks_view=tasks_view)
     )
     response.headers["Cache-Control"] = "no-store"
     return response
@@ -698,9 +736,20 @@ def _load_params(data: dict) -> tuple:
         except (TypeError, ValueError):
             return None
 
+    def _float_arg(key: str):
+        val = data.get(key)
+        if val is None:
+            return None
+        try:
+            val = float(val)
+            return val if 0.0 <= val <= 2.0 else None
+        except (TypeError, ValueError):
+            return None
+
     max_completion_tokens = _int_arg("max_completion_tokens")
     budget_tokens = _int_arg("budget_tokens")
-    return model, max_tokens, stop, reasoning_effort, max_completion_tokens, budget_tokens
+    temperature = _float_arg("temperature")
+    return model, max_tokens, stop, reasoning_effort, max_completion_tokens, budget_tokens, temperature
 
 
 def _build_messages(data: dict) -> list[dict]:
@@ -718,11 +767,12 @@ def _build_messages(data: dict) -> list[dict]:
 @app.route("/chat", methods=["POST"])
 def chat_endpoint():
     data = request.get_json()
-    model, max_tokens, stop, reasoning_effort, max_completion_tokens, budget_tokens = _load_params(data)
+    model, max_tokens, stop, reasoning_effort, max_completion_tokens, budget_tokens, temperature = _load_params(data)
     try:
         reply = chat(_build_messages(data), model=model, max_tokens=max_tokens, stop=stop,
                      reasoning_effort=reasoning_effort,
-                     max_completion_tokens=max_completion_tokens, budget_tokens=budget_tokens)
+                     max_completion_tokens=max_completion_tokens, budget_tokens=budget_tokens,
+                     temperature=temperature)
         return jsonify({"reply": reply, "metrics": last(), "error": None})
     except Exception as exc:
         return jsonify({"reply": None, "metrics": last(), "error": str(exc)})
@@ -731,7 +781,7 @@ def chat_endpoint():
 @app.route("/chat/stream", methods=["POST"])
 def chat_stream_endpoint():
     data = request.get_json()
-    model, max_tokens, stop, reasoning_effort, max_completion_tokens, budget_tokens = _load_params(data)
+    model, max_tokens, stop, reasoning_effort, max_completion_tokens, budget_tokens, temperature = _load_params(data)
     messages = _build_messages(data)
     task = by_id((data.get("task_id") or "").strip())
 
@@ -745,7 +795,8 @@ def chat_stream_endpoint():
             for kind, text in stream_chat(messages, model=model, max_tokens=max_tokens, stop=stop,
                                           reasoning_effort=reasoning_effort,
                                           max_completion_tokens=max_completion_tokens,
-                                          budget_tokens=budget_tokens):
+                                          budget_tokens=budget_tokens,
+                                          temperature=temperature):
                 if kind == "content":
                     answer_buf.append(text)
                     produced = True
@@ -756,9 +807,10 @@ def chat_stream_endpoint():
             stopped_by_stop = stop_active and finish_reason == "stop"
             answer = "".join(answer_buf)
             correct = task.check(answer) if task else None
+            format_ok = task.check_format(answer) if task else None
             payload = {"kind": "done", "metrics": last(), "finish_reason": finish_reason,
                        "empty": not produced, "stopped_by_stop": stopped_by_stop,
-                       "answer": answer, "correct": correct}
+                       "answer": answer, "correct": correct, "format_ok": format_ok}
             yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
         except Exception as exc:
             error = {"kind": "error", "message": str(exc)}
@@ -771,16 +823,12 @@ def chat_stream_endpoint():
                     headers={"Cache-Control": "no-store"})
 
 
-def _run_case(task, instr: str, effort: str, model: str) -> dict:
-    """Run one (task, method, reasoning) case and return grading + metrics."""
-    messages = []
-    if instr:
-        messages.append({"role": "system", "content": instr})
-    messages.append({"role": "user", "content": task.prompt})
-
+def _run_one(task, temp: float, model: str) -> dict:
+    """Run a single (task, temperature) sample and return grading + metrics."""
+    messages = [{"role": "user", "content": task.prompt}]
     start = time.perf_counter()
     buf = []
-    for kind, text in stream_chat(messages, model=model, reasoning_effort=effort):
+    for kind, text in stream_chat(messages, model=model, temperature=temp):
         if kind == "content":
             buf.append(text)
     elapsed = time.perf_counter() - start
@@ -792,89 +840,168 @@ def _run_case(task, instr: str, effort: str, model: str) -> dict:
     latency = m.get("latency_ms")
     time_s = latency / 1000.0 if latency is not None else elapsed
     return {
-        "correct": bool(task.check(answer)),
         "answer": answer,
+        "correct": task.check(answer),
+        "format_ok": task.check_format(answer),
         "tokens": tokens,
         "time_s": time_s,
     }
 
 
-def _verdict(rows: list[dict]) -> list[str]:
-    """Build a short data-driven analysis from the aggregated comparison rows."""
-    settings = [l for l, _ in REASONING_SETTINGS]
-    by_method: dict[str, dict[str, dict]] = {}
+def _tokenize(s: str) -> set[str]:
+    return set(re.findall(r"[a-zа-яё0-9]+", (s or "").lower()))
+
+
+def _jaccard(a: str, b: str) -> float:
+    A, B = _tokenize(a), _tokenize(b)
+    if not A and not B:
+        return 1.0 if a == b else 0.0
+    union = A | B
+    return len(A & B) / len(union) if union else 0.0
+
+
+def _diversity(answers: list[str]) -> tuple[int, float]:
+    """Return (number of distinct answers, average pairwise token similarity in %)."""
+    sigs = [" ".join(_tokenize(a)) for a in answers]
+    distinct = len({s for s in sigs if s})
+    total = len(answers)
+    pairs = 0
+    sim_sum = 0.0
+    for i in range(total):
+        for j in range(i + 1, total):
+            sim_sum += _jaccard(answers[i], answers[j])
+            pairs += 1
+    avg = sim_sum / pairs if pairs else 1.0
+    return distinct, round(avg * 100, 1)
+
+
+def _verdict(rows: list[dict]) -> list[dict]:
+    """Build data-driven conclusions grouped into sections."""
+    by_task: dict[str, list[dict]] = {}
     for r in rows:
-        by_method.setdefault(r["method"], {})[r["setting"]] = r
+        by_task.setdefault(r["task_id"], []).append(r)
 
-    lines = []
-    direct = by_method.get(COMPARE_METHODS[0][0], {})
-    for set_label in settings:
-        base = direct.get(set_label)
-        if not base:
-            continue
-        helpers = []
-        for mlabel, _ in COMPARE_METHODS[1:]:
-            c = by_method.get(mlabel, {}).get(set_label)
-            if c and c["correct"] > base["correct"]:
-                helpers.append(f"{mlabel} (+{c['correct'] - base['correct']})")
-        if helpers:
-            lines.append(f"На «{set_label}» доп. приёмы дают верность выше прямого ответа: " + ", ".join(helpers))
+    def cell(task_id: str, temp: float) -> dict | None:
+        for r in by_task.get(task_id, []):
+            if r["temp"] == temp:
+                return r
+        return None
+
+    # ---- Section: Сравните ----
+    compare_lines = []
+    for r in rows:
+        if r["kind"] == "numeric":
+            quality = f"верно {r['correct']}/{RUNS_PER_CELL}"
         else:
-            lines.append(f"На «{set_label}» доп. приёмы не поднимают верность выше прямого ответа.")
+            quality = f"формат {r['format_ok']}/{RUNS_PER_CELL}"
+        compare_lines.append(
+            f"«{r['task_title']}» · temperature={r['temp']}: уникальных ответов {r['distinct']}/{RUNS_PER_CELL}, "
+            f"схожесть {r['similarity']}%, {quality}, проблемных прогонов {r['broken']}."
+        )
 
-    # Compare effort levels: if token totals barely differ, effort is likely not effective.
-    totals = {}
-    for set_label in settings:
-        totals[set_label] = round(sum(
-            by_method.get(m, {}).get(set_label, {}).get("tokens") or 0
-            for m, _ in COMPARE_METHODS
-        ))
-    lines.append(
-        f"Суммарные токены: {settings[0]} (минимум рассуждения) = {totals.get(settings[0], '—')}, "
-        f"{settings[1]} (максимум рассуждения) = {totals.get(settings[1], '—')}."
-    )
-    if totals.get(settings[0]) and totals.get(settings[1]) and abs(totals[settings[0]] - totals[settings[1]]) < 0.15:
-        lines.append("Разница между low и high по токенам минимальна — вероятно, reasoning_effort не управляет "
-                     "глубиной рассуждения на этом эндпоинте (параметр игнорируется).")
-    return lines
+    # ---- Section: Одинаковый ли ответ при temperature = 0? ----
+    # Does temperature=0 give the same answer every time?
+    deter_lines = []
+    for task in TASKS:
+        r0 = cell(task.id, 0)
+        if not r0:
+            continue
+        if r0["distinct"] <= 1:
+            deter_lines.append(f"«{task.title}» — да, при temperature=0 все {RUNS_PER_CELL} ответов одинаковые.")
+        else:
+            deter_lines.append(f"«{task.title}» — нет, при temperature=0 получилось {r0['distinct']} разных ответов.")
+
+    # Best temperature per task.
+    best_lines = []
+    for task in TASKS:
+        best_r = max(by_task.get(task.id, []), key=lambda r: _score(task, r))
+        if best_r is None:
+            continue
+        if task.kind == "numeric":
+            best_lines.append(
+                f"для «{task.title}» лучше temperature={best_r['temp']} (верно {best_r['correct']}/{RUNS_PER_CELL})"
+            )
+        else:
+            best_lines.append(
+                f"для «{task.title}» лучше temperature={best_r['temp']} "
+                f"(формат {best_r['format_ok']}/{RUNS_PER_CELL}, разнообразие {best_r['distinct']}/{RUNS_PER_CELL})"
+            )
+
+    # ---- Section: Результат ----
+    result_lines = []
+    if best_lines:
+        result_lines.append("Лучшие настройки по задачам: " + "; ".join(best_lines) + ".")
+    for task in TASKS:
+        parts = []
+        for temp in TEMPERATURES:
+            r = cell(task.id, temp)
+            ex = (r["runs"][0]["answer"].strip() if r and r["runs"] else "") or "—"
+            ex = ex[:80] + "…" if len(ex) > 80 else ex
+            parts.append(f"temperature={temp}: «{ex}»")
+        result_lines.append(f"«{task.title}» · " + " | ".join(parts) + ".")
+
+        if task.kind == "numeric":
+            result_lines.append(
+                f"Вывод по «{task.title}»: разнообразие здесь вредит — нужен стабильный верный ответ, "
+                f"поэтому предпочтительно temperature=0; более высокие значения дают разброс без пользы."
+            )
+        else:
+            result_lines.append(
+                f"Вывод по «{task.title}»: разнообразие здесь полезно — чем больше разных идей/вариантов, тем лучше, "
+                f"поэтому подходят более высокие temperature ({', '.join(str(t) for t in TEMPERATURES[1:])}), "
+                f"а temperature=0 даёт однообразные повторяющиеся ответы."
+            )
+
+    return [
+        {"title": "Сравнение", "lines": compare_lines},
+        {"title": "Одинаковый ли ответ при temperature = 0?", "lines": deter_lines},
+        {"title": "Результат", "lines": result_lines},
+    ]
+
+
+def _score(task, r: dict) -> float:
+    """A simple score used to pick the best temperature for a task."""
+    if task.kind == "numeric":
+        return r["correct"] + (1 - r["similarity"] / 100.0) * 0.01
+    return r["format_ok"] + r["distinct"] / 100.0
 
 
 @app.route("/experiment", methods=["POST"])
 def experiment_endpoint():
-    """Run the full 'Day 3' experiment: 4 methods x 2 reasoning settings x all tasks."""
+    """Run each task at temperature 0 / 0.7 / 1.2, 5 times per pair."""
     data = request.get_json() or {}
     model = (data.get("model") or "").strip() or MODELS[0]
 
     def generate():
         rows: list[dict] = []
-        total_units = len(REASONING_SETTINGS) * len(COMPARE_METHODS) * len(TASKS)
+        total_units = len(TEMPERATURES) * len(TASKS) * RUNS_PER_CELL
         done_units = 0
         try:
-            for set_label, effort in REASONING_SETTINGS:
-                for mlabel, instr in COMPARE_METHODS:
-                    correct = 0
-                    tokens = 0
-                    ttime = 0.0
-                    count = 0
-                    for task in TASKS:
+            for task in TASKS:
+                for temp in TEMPERATURES:
+                    runs = []
+                    for i in range(RUNS_PER_CELL):
                         done_units += 1
                         progress = {
                             "kind": "progress",
-                            "text": f"({done_units}/{total_units}) {mlabel} · reasoning_effort={set_label} → {task.title}",
+                            "text": f"({done_units}/{total_units}) {task.title} · temperature={temp} · прогон {i + 1}",
                         }
                         yield f"data: {json.dumps(progress, ensure_ascii=False)}\n\n"
-                        r = _run_case(task, instr, effort, model)
-                        correct += 1 if r["correct"] else 0
-                        tokens += r["tokens"] or 0
-                        ttime += r["time_s"]
-                        count += 1
+                        runs.append(_run_one(task, temp, model))
+                    distinct, similarity = _diversity([r["answer"] for r in runs])
                     rows.append({
-                        "method": mlabel,
-                        "setting": set_label,
-                        "correct": correct,
-                        "total": count,
-                        "tokens": tokens,
-                        "time": round(ttime, 1),
+                        "task_id": task.id,
+                        "task_title": task.title,
+                        "kind": task.kind,
+                        "temp": temp,
+                        "runs": runs,
+                        "distinct": distinct,
+                        "similarity": similarity,
+                        "correct": sum(1 for r in runs if r["correct"] is True),
+                        "format_ok": sum(1 for r in runs if r["format_ok"]),
+                        "broken": sum(1 for r in runs if r["format_ok"] is False or r["correct"] is False),
+                        "tokens": sum(r["tokens"] or 0 for r in runs),
+                        "time_s": round(sum(r["time_s"] for r in runs), 1),
                     })
             result = {"kind": "result", "matrix": rows, "verdict": _verdict(rows)}
             yield f"data: {json.dumps(result, ensure_ascii=False)}\n\n"
