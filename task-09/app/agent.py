@@ -7,6 +7,7 @@ lose context — the dialog continues exactly where it left off.
 import json
 
 from . import store
+from .context import build_context
 from .llm import chat
 from .tokens import count_messages, count_tokens
 from .tools import TOOL_SCHEMAS, run_tool
@@ -27,15 +28,18 @@ class Agent:
         self.model = model
         self.temperature = temperature
 
-    def ask(self, user_text: str) -> dict:
+    def ask(self, user_text: str, context_mode: str = "full") -> dict:
         """Answer a user message, possibly using tools. Returns a result dict.
 
-        The existing conversation is loaded from persistent storage, the new
-        user message and every tool call/result are appended, and the whole
-        history is saved back at the end.
+        The context sent to the LLM is built according to ``context_mode``
+        ("full" — the whole history, "summary" — rolling summary + recent
+        messages). The stored history always keeps every message: in summary
+        mode only the request is trimmed, the DB stays complete.
         """
-        self.messages = store.load_messages()
+        self.messages, context_info = build_context(context_mode)
         history_tokens = count_messages(self.messages)
+        full_history = store.load_messages()
+        base_len = len(self.messages)  # everything past this is new this turn
         self.messages.append({"role": "user", "content": user_text})
         request_tokens = count_tokens(user_text)
         tool_calls_used = 0  # individual tool executions, not rounds
@@ -67,12 +71,13 @@ class Agent:
             # No tool calls -> the model gave a final answer -> done.
             if not message.tool_calls:
                 self.messages.append({"role": "assistant", "content": message.content or ""})
-                store.save_messages(self.messages)
+                store.save_messages(full_history + self.messages[base_len:])
                 text = (message.content or "").strip()
                 return {
                     "reply": text,
                     "tool_calls_used": tool_calls_used,
                     "steps": steps,
+                    "context": context_info,
                     "tokens": {
                         "request": request_tokens,
                         "history": history_tokens,
@@ -110,11 +115,12 @@ class Agent:
             "role": "assistant",
             "content": "Агент перестал отвечать (превышен лимит шагов). Попробуйте переформулировать запрос.",
         })
-        store.save_messages(self.messages)
+        store.save_messages(full_history + self.messages[base_len:])
         return {
             "reply": "Агент перестал отвечать (превышен лимит шагов). Попробуйте переформулировать запрос.",
             "tool_calls_used": tool_calls_used,
             "steps": steps,
+            "context": context_info,
             "tokens": {
                 "request": request_tokens,
                 "history": history_tokens,

@@ -20,7 +20,7 @@ def _connect() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """Create the messages table if it does not exist."""
+    """Create the messages and context_state tables if they do not exist."""
     with _connect() as conn:
         conn.execute(
             """
@@ -31,6 +31,16 @@ def init_db() -> None:
                 tool_calls    TEXT,
                 tool_call_id  TEXT,
                 created_at    TEXT NOT NULL
+            )
+            """
+        )
+        # Rolling summary for the "summary + 10 последних" context mode:
+        # the summary text and how many oldest messages it replaces.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS context_state (
+                key   TEXT PRIMARY KEY,
+                value TEXT
             )
             """
         )
@@ -76,8 +86,37 @@ def save_messages(messages: list[dict]) -> None:
             )
 
 
+def load_summary() -> tuple[str | None, int]:
+    """Return (summary_text, how many oldest messages it replaces)."""
+    init_db()
+    with _connect() as conn:
+        rows = dict(conn.execute("SELECT key, value FROM context_state").fetchall())
+
+    summary = rows.get("summary") or None
+    try:
+        covered = int(rows.get("summarized") or 0)
+    except (TypeError, ValueError):
+        covered = 0
+    return summary, covered
+
+
+def save_summary(summary: str | None, covered: int) -> None:
+    """Store the rolling summary and the number of messages it covers."""
+    init_db()
+    with _connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO context_state (key, value) VALUES (?, ?)",
+            ("summary", summary),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO context_state (key, value) VALUES (?, ?)",
+            ("summarized", str(covered)),
+        )
+
+
 def clear_history() -> None:
     """Drop all stored messages, starting a brand new conversation."""
     init_db()
     with _connect() as conn:
         conn.execute("DELETE FROM messages")
+        conn.execute("DELETE FROM context_state")
