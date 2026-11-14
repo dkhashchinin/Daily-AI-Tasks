@@ -1,0 +1,4 @@
+scenario,turn,status,steps,tool_calls,prompt_tokens,completion_tokens,cost,cum_cost,history_tokens,request_tokens,reply_tokens,pred_first_call,latency_s,db_messages,http_status,error
+overflow,1,error,0,0,0,0,0.0,0.0,1050420,199,0,1051319,0.61,105,200,"This model's maximum context length is 1000000 tokens. However, you requested 1051323 tokens (1051323 in the messages). Please reduce the length of the messages."
+overflow,2,error,0,0,0,0,0.0,0.0,1050420,199,0,1051319,0.57,105,200,"This model's maximum context length is 1000000 tokens. However, you requested 1051323 tokens (1051323 in the messages). Please reduce the length of the messages."
+overflow,3,error,0,0,0,0,0.0,0.0,1050420,199,0,1051319,0.62,105,200,"This model's maximum context length is 1000000 tokens. However, you requested 1051323 tokens (1051323 in the messages). Please reduce the length of the messages."

@@ -1,0 +1,2 @@
+scenario,turn,status,steps,tool_calls,prompt_tokens,completion_tokens,cost,cum_cost,history_tokens,request_tokens,reply_tokens,pred_first_call,latency_s,db_messages,http_status,error
+baseline,1,ok,1,0,711,50,0.01,0.01,0,7,47,707,0.01,2,200,
