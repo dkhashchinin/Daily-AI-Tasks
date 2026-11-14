@@ -4,8 +4,10 @@ from flask import Flask, jsonify, render_template_string, request
 from .agent import Agent
 from . import store
 from .config import MODELS, MODEL
+from .lab_web import lab_bp
 
 app = Flask(__name__)
+app.register_blueprint(lab_bp, url_prefix="/lab")
 
 HTML = r"""<!doctype html>
 <html lang="ru">
@@ -28,6 +30,9 @@ HTML = r"""<!doctype html>
   #clear { font-size:12px; color:#cbd5e1; background:rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.1);
            padding:5px 12px; border-radius:999px; cursor:pointer; transition:.15s; }
   #clear:hover { background:rgba(239,68,68,.15); color:#fca5a5; border-color:rgba(239,68,68,.4); }
+  a.lab { font-size:12px; color:#cbd5e1; background:rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.1);
+          padding:5px 12px; border-radius:999px; text-decoration:none; transition:.15s; }
+  a.lab:hover { background:rgba(37,99,235,.2); color:#93c5fd; border-color:rgba(37,99,235,.45); }
   #chat { flex:1; overflow-y:auto; padding:24px 20px; display:flex; flex-direction:column; gap:16px; }
   #chat::-webkit-scrollbar { width:8px; }
   #chat::-webkit-scrollbar-thumb { background:rgba(255,255,255,.12); border-radius:8px; }
@@ -64,6 +69,7 @@ HTML = r"""<!doctype html>
 <header>
   <span class="logo"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/></svg></span>
   <h1>Простой агент</h1>
+  <a class="lab" href="/lab" title="Сравнить короткий, длинный диалог и переполнение">Лаборатория</a>
   <button id="clear" type="button" title="Очистить историю">Сбросить</button>
   <span class="model">{{ model }}</span>
 </header>
@@ -118,19 +124,22 @@ async function run(){
       addRow('assistant', 'Ошибка: ' + data.error, true);
     } else {
       const bubble = addRow('assistant', data.reply || '(пустой ответ)');
+      let metaText = null;
       if (data.tokens) {
-        const meta = document.createElement('div');
-        meta.style.cssText = 'margin-top:8px;font-size:11px;color:#64748b;';
         const t = data.tokens;
-        meta.textContent = 'Инструментов вызвано: ' + data.tool_calls_used +
+        metaText = 'Инструментов вызвано: ' + data.tool_calls_used +
           ' · шагов: ' + data.steps +
           ' · токены: запрос ' + t.request + ', история ' + t.history +
           ', ответ ' + t.response + ' (prompt ' + t.prompt + ', completion ' + t.completion + ')';
-        bubble.appendChild(meta);
+        if (typeof t.cost === 'number') metaText += ' · стоимость ' + t.cost.toFixed(4) + ' \u20bd';
+        if (typeof t.balance === 'number') metaText += ' · баланс ' + t.balance.toFixed(2) + ' \u20bd';
       } else if (data.tool_calls_used > 0) {
+        metaText = 'Инструментов вызвано: ' + data.tool_calls_used + ' · шагов: ' + data.steps;
+      }
+      if (metaText) {
         const meta = document.createElement('div');
         meta.style.cssText = 'margin-top:8px;font-size:11px;color:#64748b;';
-        meta.textContent = 'Инструментов вызвано: ' + data.tool_calls_used + ' · шагов: ' + data.steps;
+        meta.textContent = metaText;
         bubble.appendChild(meta);
       }
       if (data.model) modelBadge.textContent = data.model;
@@ -220,7 +229,8 @@ def api_clear():
 
 
 def main() -> None:
-    app.run(host="0.0.0.0", port=5000)
+    # threaded: the token lab runs in the background while the page polls.
+    app.run(host="0.0.0.0", port=5000, threaded=True)
 
 
 if __name__ == "__main__":

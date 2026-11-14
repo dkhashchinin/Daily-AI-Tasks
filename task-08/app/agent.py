@@ -38,9 +38,12 @@ class Agent:
         history_tokens = count_messages(self.messages)
         self.messages.append({"role": "user", "content": user_text})
         request_tokens = count_tokens(user_text)
-        tool_calls_used = 0
+        tool_calls_used = 0  # individual tool executions, not rounds
+        steps = 0            # LLM round-trips
         prompt_tokens = 0
         completion_tokens = 0
+        cost = 0.0
+        balance = None
 
         for _ in range(MAX_STEPS):
             response = chat(
@@ -50,11 +53,16 @@ class Agent:
                 tools=TOOL_SCHEMAS,
                 tool_choice="auto",
             )
+            steps += 1
             message = response.choices[0].message
             usage = getattr(response, "usage", None)
             if usage is not None:
                 prompt_tokens += getattr(usage, "prompt_tokens", 0) or 0
                 completion_tokens += getattr(usage, "completion_tokens", 0) or 0
+                # AITUNNEL extends the standard usage object with billing fields.
+                cost += float(getattr(usage, "cost", 0) or 0)
+                if getattr(usage, "balance", None) is not None:
+                    balance = usage.balance
 
             # No tool calls -> the model gave a final answer -> done.
             if not message.tool_calls:
@@ -64,7 +72,7 @@ class Agent:
                 return {
                     "reply": text,
                     "tool_calls_used": tool_calls_used,
-                    "steps": tool_calls_used + 1,
+                    "steps": steps,
                     "tokens": {
                         "request": request_tokens,
                         "history": history_tokens,
@@ -72,11 +80,13 @@ class Agent:
                         "prompt": prompt_tokens,
                         "completion": completion_tokens,
                         "total": prompt_tokens + completion_tokens,
+                        "cost": cost,
+                        "balance": balance,
                     },
                 }
 
             # The model asked for one or more tools. Execute each and feed results back.
-            tool_calls_used += 1
+            tool_calls_used += len(message.tool_calls)
             self.messages.append({
                 "role": "assistant",
                 "content": message.content,
@@ -104,7 +114,7 @@ class Agent:
         return {
             "reply": "Агент перестал отвечать (превышен лимит шагов). Попробуйте переформулировать запрос.",
             "tool_calls_used": tool_calls_used,
-            "steps": MAX_STEPS,
+            "steps": steps,
             "tokens": {
                 "request": request_tokens,
                 "history": history_tokens,
@@ -112,5 +122,7 @@ class Agent:
                 "prompt": prompt_tokens,
                 "completion": completion_tokens,
                 "total": prompt_tokens + completion_tokens,
+                "cost": cost,
+                "balance": balance,
             },
         }

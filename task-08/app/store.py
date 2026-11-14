@@ -6,15 +6,31 @@ and continue a conversation as if it never stopped.
 """
 import json
 import sqlite3
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = BASE_DIR / "conversation.db"
 
+# The token lab runs scenarios in its own thread against its own database, so
+# the path can be overridden per context (thread) without disturbing the live
+# conversation, which keeps using DB_PATH.
+_DB_PATH_OVERRIDE: ContextVar[Path | None] = ContextVar("db_path_override", default=None)
+
+
+def use_db(path: str | Path) -> None:
+    """Point this context (thread) at another database file."""
+    _DB_PATH_OVERRIDE.set(Path(path))
+
+
+def current_db_path() -> Path:
+    """Return the database in use by this context."""
+    return _DB_PATH_OVERRIDE.get() or DB_PATH
+
 
 def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(current_db_path())
     conn.row_factory = sqlite3.Row
     return conn
 

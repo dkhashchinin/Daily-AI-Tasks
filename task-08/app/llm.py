@@ -1,7 +1,20 @@
 """LLM client wrapper around the OpenAI-compatible HTTP API."""
+from contextvars import ContextVar
+from typing import Callable
+
 from openai import OpenAI
 
 from .config import MODEL, BASE_URL, require_key
+
+# The token lab exercises the whole application -- routes, storage, error
+# handling -- against a simulated model. The override lives in a context
+# variable, so it only affects the thread that installed it.
+_CHAT_OVERRIDE: ContextVar[Callable | None] = ContextVar("chat_override", default=None)
+
+
+def use_chat(fn: Callable | None) -> None:
+    """Route :func:`chat` through ``fn`` for this context (thread) only."""
+    _CHAT_OVERRIDE.set(fn)
 
 
 def get_client() -> OpenAI:
@@ -17,6 +30,11 @@ def chat(messages: list[dict], *, model: str | None = None,
     When ``tools`` are provided the model may return tool calls instead of
     text, so the caller inspects ``response.choices[0].message``.
     """
+    override = _CHAT_OVERRIDE.get()
+    if override is not None:
+        return override(messages, model=model, temperature=temperature,
+                        tools=tools, tool_choice=tool_choice)
+
     model = model or MODEL
     client = get_client()
     kwargs = {"model": model, "messages": messages}
