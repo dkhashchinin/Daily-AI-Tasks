@@ -26,14 +26,17 @@ HTML = r"""<!doctype html>
   header .ctx { margin-left:auto; display:flex; align-items:center; gap:7px; font-size:12px; color:#94a3b8; }
   header .model { font-size:12px; color:#94a3b8; background:rgba(255,255,255,.06);
                   border:1px solid rgba(255,255,255,.1); padding:5px 12px; border-radius:999px; }
-  #contextMode { font-size:12px; color:#e2e8f0; background:rgba(255,255,255,.06);
-                 border:1px solid rgba(255,255,255,.1); padding:5px 8px; border-radius:999px;
-                 cursor:pointer; outline:none; transition:.15s; }
-  #contextMode:hover { border-color:#2563eb; }
-  #contextMode option { background:#0f172a; color:#e2e8f0; }
-  #clear { font-size:12px; color:#cbd5e1; background:rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.1);
+  #contextMode, #branchSelect { font-size:12px; color:#e2e8f0; background:rgba(255,255,255,.06);
+                  border:1px solid rgba(255,255,255,.1); padding:5px 8px; border-radius:999px;
+                  cursor:pointer; outline:none; transition:.15s; }
+  #contextMode:hover, #branchSelect:hover { border-color:#2563eb; }
+  #contextMode option, #branchSelect option { background:#0f172a; color:#e2e8f0; }
+  #clear, #checkpoint, #branchAdd, #branchDel { font-size:12px; color:#cbd5e1; background:rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.1);
            padding:5px 12px; border-radius:999px; cursor:pointer; transition:.15s; }
   #clear:hover { background:rgba(239,68,68,.15); color:#fca5a5; border-color:rgba(239,68,68,.4); }
+  #checkpoint:hover, #branchAdd:hover { border-color:#2563eb; color:#bfdbfe; }
+  #branchDel:hover { background:rgba(239,68,68,.15); color:#fca5a5; border-color:rgba(239,68,68,.4); }
+  #branchDel:disabled { opacity:.4; cursor:not-allowed; }
   #experiment { font-size:12px; color:#bfdbfe; background:rgba(37,99,235,.15); border:1px solid rgba(37,99,235,.4);
                 padding:5px 12px; border-radius:999px; cursor:pointer; transition:.15s; }
   #experiment:hover { background:rgba(37,99,235,.3); color:#fff; }
@@ -93,12 +96,20 @@ HTML = r"""<!doctype html>
   <span class="logo"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/></svg></span>
   <h1>Простой агент</h1>
   <span class="ctx">
-    <label for="contextMode" title="Что отправлять модели: всю историю или сводку + последние сообщения">Управление контекстом</label>
+    <label for="contextMode" title="Что отправлять модели: сводку/факты + последние сообщения или только окно">Управление контекстом</label>
     <select id="contextMode">
-      <option value="full">полная история</option>
       <option value="summary">summary + 10 последних</option>
+      <option value="window">sliding window (10 последних)</option>
+      <option value="facts">facts + 10 последних</option>
     </select>
   </span>
+  <span class="ctx">
+    <label for="branchSelect" title="Ветки диалога — независимые продолжения одного диалога">Ветка</label>
+    <select id="branchSelect" title="Ветки диалога: выберите, в какой ветке продолжить диалог"></select>
+  </span>
+  <button id="checkpoint" type="button" title="Запомнить текущее место диалога — от этого checkpoint создаются ветки">&#9873; Checkpoint</button>
+  <button id="branchAdd" type="button" title="Создать ветку от checkpoint текущей ветки (или от её конца, если checkpoint не сохранён) и переключиться в неё">+ ветка</button>
+  <button id="branchDel" type="button" title="Удалить текущую ветку (основную удалить нельзя)">Удалить ветку</button>
   <button id="experiment" type="button" title="Прогнать один диалог в двух режимах и сравнить память и расход токенов">Эксперимент с хранением контекста</button>
   <button id="clear" type="button" title="Очистить историю">Сбросить</button>
   <span class="model">{{ model }}</span>
@@ -115,10 +126,16 @@ const sendBtn = document.getElementById('send');
 const chatEl = document.getElementById('chat');
 const modelBadge = document.querySelector('.model');
 const modeSelect = document.getElementById('contextMode');
+const branchSelect = document.getElementById('branchSelect');
+const checkpointBtn = document.getElementById('checkpoint');
+const branchAddBtn = document.getElementById('branchAdd');
+const branchDelBtn = document.getElementById('branchDel');
+let currentBranch = 1;
+let rootBranchId = 1;
 
 try {
   const saved = localStorage.getItem('contextMode');
-  if (saved === 'full' || saved === 'summary') modeSelect.value = saved;
+  if (saved && [...modeSelect.options].some(o => o.value === saved)) modeSelect.value = saved;
 } catch (e) {}
 modeSelect.addEventListener('change', () => {
   try { localStorage.setItem('contextMode', modeSelect.value); } catch (e) {}
@@ -127,6 +144,84 @@ modeSelect.addEventListener('change', () => {
 function esc(s){
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
+
+async function loadBranches(keepCurrent){
+  const data = await (await fetch('/api/branches')).json();
+  const branches = data.branches || [];
+  if (!branches.length) return;
+  rootBranchId = branches[0].id;
+  let saved = null;
+  try { saved = parseInt(localStorage.getItem('branchId'), 10); } catch (e) {}
+  const found = branches.find(b => b.id === saved);
+  currentBranch = (keepCurrent && branches.some(b => b.id === currentBranch))
+    ? currentBranch : (found ? found.id : rootBranchId);
+  branchSelect.innerHTML = branches.map(b =>
+    '<option value="' + b.id + '">' + esc(b.name) + ' · ' + b.count + ' сообщ.' +
+    (b.checkpoint_len !== null && b.checkpoint_len !== undefined ? ' · \u2691' + b.checkpoint_len : '') +
+    '</option>').join('');
+  branchSelect.value = currentBranch;
+  try { localStorage.setItem('branchId', currentBranch); } catch (e) {}
+  branchDelBtn.disabled = currentBranch === rootBranchId || branches.length <= 1;
+}
+
+branchSelect.addEventListener('change', async () => {
+  currentBranch = parseInt(branchSelect.value, 10);
+  try { localStorage.setItem('branchId', currentBranch); } catch (e) {}
+  chatEl.innerHTML = '';
+  await loadHistory();
+  await loadBranches(true);
+});
+
+checkpointBtn.addEventListener('click', async () => {
+  try {
+    const r = await (await fetch('/api/checkpoint', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ branch_id: currentBranch })
+    })).json();
+    if (r.error) { addRow('assistant', 'Ошибка: ' + r.error, true); return; }
+    addRow('assistant', '\u2691 Checkpoint сохранён: ' + r.checkpoint_len +
+      ' сообщ. в текущей ветке. Кнопка «+ ветка» создаст ветку от этой точки.');
+    await loadBranches(true);
+  } catch (err) { addRow('assistant', 'Ошибка запроса: ' + err, true); }
+});
+
+branchAddBtn.addEventListener('click', async () => {
+  try {
+    const s = await (await fetch('/api/branches')).json();
+    const n = (s.branches || []).length + 1;
+    const name = prompt('Название ветки. Она создастся от checkpoint текущей ветки ' +
+                        '(или от её конца, если checkpoint не сохранён):', 'Ветка ' + n);
+    if (name === null) return;
+    const r = await (await fetch('/api/branch/create', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from_branch_id: currentBranch, name: name })
+    })).json();
+    if (r.error) { addRow('assistant', 'Ошибка: ' + r.error, true); return; }
+    currentBranch = r.branch.id;
+    try { localStorage.setItem('branchId', currentBranch); } catch (e) {}
+    chatEl.innerHTML = '';
+    await loadBranches(false);
+    await loadHistory();
+    addRow('assistant', 'Создана ветка «' + r.branch.name + '»: первые ' + r.branch.fork_len +
+      ' сообщ. скопированы, дальше диалог идёт независимо. Переключайтесь списком «Ветка».');
+  } catch (err) { addRow('assistant', 'Ошибка запроса: ' + err, true); }
+});
+
+branchDelBtn.addEventListener('click', async () => {
+  if (!confirm('Удалить текущую ветку со всей её историей?')) return;
+  try {
+    const r = await (await fetch('/api/branch/delete', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ branch_id: currentBranch })
+    })).json();
+    if (r.error) { addRow('assistant', 'Ошибка: ' + r.error, true); return; }
+    currentBranch = rootBranchId;
+    try { localStorage.setItem('branchId', currentBranch); } catch (e) {}
+    chatEl.innerHTML = '';
+    await loadBranches(false);
+    await loadHistory();
+  } catch (err) { addRow('assistant', 'Ошибка запроса: ' + err, true); }
+});
 function scroll(){ chatEl.scrollTop = chatEl.scrollHeight; }
 function addRow(cls, text, isError){
   const row = document.createElement('div'); row.className = 'row ' + cls;
@@ -154,8 +249,12 @@ function tokenMeta(t, contextInfo){
     metaText += ' · контекст: summary';
     if (contextInfo.summary_used) metaText += ' (сводка ' + contextInfo.summary_tokens + ' ток.)';
     metaText += ' + ' + contextInfo.as_is + ' сообщ. как есть';
-  } else if (contextInfo) {
-    metaText += ' · контекст: полная история';
+  } else if (contextInfo && contextInfo.mode === 'window') {
+    metaText += ' · контекст: окно ' + contextInfo.as_is + ' сообщ.';
+  } else if (contextInfo && contextInfo.mode === 'facts') {
+    metaText += ' · контекст: facts';
+    if (contextInfo.facts_used) metaText += ' (' + contextInfo.facts_tokens + ' ток.)';
+    metaText += ' + ' + contextInfo.as_is + ' сообщ. как есть';
   }
   return metaText;
 }
@@ -179,7 +278,7 @@ async function run(){
     const r = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: text, context_mode: modeSelect.value })
+      body: JSON.stringify({ message: text, context_mode: modeSelect.value, branch_id: currentBranch })
     });
     const data = await r.json();
     hideTyping();
@@ -209,7 +308,7 @@ async function run(){
 
 async function loadHistory(){
   try {
-    const r = await fetch('/api/history');
+    const r = await fetch('/api/history?branch_id=' + currentBranch);
     const data = await r.json();
     const messages = data.messages || [];
     if (!messages.length) {
@@ -227,9 +326,10 @@ async function loadHistory(){
 }
 
 document.getElementById('clear').addEventListener('click', async () => {
-  if (!confirm('Очистить историю диалога?')) return;
+  if (!confirm('Очистить историю диалога, все ветки и чекпоинты?')) return;
   await fetch('/api/clear', { method: 'POST' });
   chatEl.innerHTML = '';
+  await loadBranches(false);
   addRow('assistant', 'История очищена. Начинаем заново!');
 });
 
@@ -240,6 +340,9 @@ function setExpUI(disabled){
   input.disabled = disabled;
   sendBtn.disabled = disabled;
   expBtn.disabled = disabled;
+  checkpointBtn.disabled = disabled;
+  branchAddBtn.disabled = disabled;
+  branchDelBtn.disabled = disabled || currentBranch === rootBranchId;
 }
 
 function expStatus(text){
@@ -264,9 +367,12 @@ function renderStep(data){
   const p = data.progress || {};
   const key = data.run + ':' + data.stage;
   if (exp.lastKey !== key) {
-    if (exp.lastKey === null) expDivider('Прогон 1 · режим «' + data.label + '»');
-    else if (data.stage === 'dialog') expDivider('Прогон 2 · режим «' + data.label + '» · история очищена');
-    else expDivider('Вопросы по деталям · режим «' + data.label + '»');
+    if (data.stage === 'dialog') {
+      expDivider('Прогон ' + (data.run + 1) + ' · режим «' + data.label + '»' +
+                 (data.run > 0 ? ' · история очищена' : ''));
+    } else {
+      expDivider('Вопросы по деталям · режим «' + data.label + '»');
+    }
     exp.lastKey = key;
   }
   addRow('user', p.user);
@@ -285,43 +391,71 @@ function renderStep(data){
 
 function num(n){ return (n || 0).toLocaleString('ru-RU'); }
 
+function bestFlags(values, mode){
+  const b = mode === 'min' ? Math.min.apply(null, values) : Math.max.apply(null, values);
+  return values.map(v => v === b);
+}
+
 function renderReport(rep){
-  const [a, b] = rep.runs;
+  const runs = rep.runs;
   const div = document.createElement('div');
   div.className = 'report';
 
-  let html = '<h3>Эксперимент: ' + esc(rep.title) + '</h3>';
-  html += '<table><tr><th>Метрика</th><th>' + esc(a.label) + '</th><th>' + esc(b.label) + '</th></tr>';
-  html += '<tr><td>Вопросов вспомнено полностью</td><td class="' + (a.remembered >= b.remembered ? 'good' : '') + '">' +
-          a.remembered + ' / ' + a.questions_total + '</td><td class="' + (b.remembered >= a.remembered ? 'good' : '') + '">' +
-          b.remembered + ' / ' + b.questions_total + '</td></tr>';
-  html += '<tr><td>Деталей найдено</td><td class="' + (a.details_found >= b.details_found ? 'good' : '') + '">' +
-          a.details_found + ' / ' + a.details_total + '</td><td class="' + (b.details_found >= a.details_found ? 'good' : '') + '">' +
-          b.details_found + ' / ' + b.details_total + '</td></tr>';
-  const ta = a.api.prompt + a.api.completion;
-  const tb = b.api.prompt + b.api.completion;
-  html += '<tr><td>Prompt + completion (API)</td><td class="' + (ta <= tb ? 'good' : '') + '">' + num(ta) + '</td>' +
-          '<td class="' + (tb <= ta ? 'good' : '') + '">' + num(tb) + '</td></tr>';
-  html += '<tr><td>&mdash; prompt / completion</td><td>' + num(a.api.prompt) + ' / ' + num(a.api.completion) + '</td>' +
-          '<td>' + num(b.api.prompt) + ' / ' + num(b.api.completion) + '</td></tr>';
-  html += '<tr><td>Суммаризатор (доп. вызовы)</td><td>&mdash;</td>' +
-          '<td>' + b.summary_usage.calls + ' выз. · ' + num(b.summary_usage.prompt + b.summary_usage.completion) + ' ток.</td></tr>';
-  if (a.api.cost || b.api.cost) {
-    html += '<tr><td>Стоимость</td><td>' + a.api.cost.toFixed(4) + ' \u20bd</td><td>' + b.api.cost.toFixed(4) + ' \u20bd</td></tr>';
-  }
-  html += '<tr><td>Средний контекст вопроса (локально)</td><td>' + num(a.avg_context_tokens) + '</td>' +
-          '<td>' + num(b.avg_context_tokens) + '</td></tr>';
-  html += '</table>';
+  const totals = runs.map(r => r.api.prompt + r.api.completion);
+  const qt = runs[0].questions_total;
+  const dt = runs[0].details_total;
+  const remBest = bestFlags(runs.map(r => r.remembered), 'max');
+  const memBest = bestFlags(runs.map(r => r.details_found), 'max');
+  const tokBest = bestFlags(totals, 'min');
 
-  const memWinner = a.details_found > b.details_found ? a.label : (b.details_found > a.details_found ? b.label : null);
-  const tokWinner = ta < tb ? a.label : (tb < ta ? b.label : null);
+  let html = '<h3>Эксперимент: ' + esc(rep.title) + '</h3>';
+  html += '<table><tr><th>Стратегия</th><th>Вспомнено вопросов</th><th>Деталей найдено</th>' +
+          '<th>Токены API (prompt + completion)</th><th>Стоимость</th>' +
+          '<th>Средний контекст вопроса</th><th>Поддержка: код и доп. вызовы</th></tr>';
+  runs.forEach((r, i) => {
+    const eu = r.extra_usage || {};
+    const mt = r.maintenance || {};
+    html += '<tr>' +
+      '<td><b>' + esc(r.label) + '</b></td>' +
+      '<td class="' + (remBest[i] ? 'good' : '') + '">' + r.remembered + ' / ' + qt + '</td>' +
+      '<td class="' + (memBest[i] ? 'good' : '') + '">' + r.details_found + ' / ' + dt + '</td>' +
+      '<td class="' + (tokBest[i] ? 'good' : '') + '">' + num(totals[i]) +
+        '<div style="font-size:11px;color:#94a3b8;">prompt ' + num(r.api.prompt) +
+        ' / completion ' + num(r.api.completion) + '</div></td>' +
+      '<td>' + (r.api.cost ? r.api.cost.toFixed(4) + ' \u20bd' : '&mdash;') + '</td>' +
+      '<td>' + num(r.avg_context_tokens) + '</td>' +
+      '<td>' + (mt.code_lines ? '&asymp;' + mt.code_lines + ' строк кода' : '&mdash;') +
+        (mt.code ? '<div style="font-size:11px;color:#94a3b8;">' + esc(mt.code) + '</div>' : '') +
+        '<div style="font-size:11px;color:#94a3b8;">' +
+        (eu.calls ? eu.calls + ' доп. выз. · ' + num(eu.prompt + eu.completion) + ' ток. (замер)' : 'без доп. вызовов') +
+        '</div>' +
+        (mt.calls_note ? '<div style="font-size:11px;color:#94a3b8;">' + esc(mt.calls_note) + '</div>' : '') +
+      '</td>' +
+      '</tr>';
+  });
+  html += '</table>';
+  html += '<div style="font-size:11px;color:#64748b;margin-top:4px;">Поддержка: строк кода — приближение по стратегическому коду в app/context.py; доп. вызовы — фактический замер прогона.</div>';
+
+  html += '<div class="verdict" style="margin-top:10px;">' +
+    '<b>Какая стратегия для какого сценария:</b>' +
+    '<ul style="margin:6px 0 0 18px;padding:0;line-height:1.55;">' +
+    '<li><b>summary + 10 последних</b> — длинные многоходовые диалоги (работа над задачей, поддержка, онбординг): ничего не теряется совсем, контекст ограничен; цена — вызов суммаризатора за ход при переполнении окна.</li>' +
+    '<li><b>sliding window (10 последних)</b> — короткие или «одноразовые» диалоги, где старые детали не нужны: минимум кода и ноль доп. вызовов, но всё за пределами окна забывается навсегда.</li>' +
+    '<li><b>facts + 10 последних</b> — диалоги с множеством конкретики (заявки, брони, договорённости с параметрами): ключевые факты живут до конца диалога в компактном key-value блоке; цена — вызов извлечения после каждой реплики и код парсинга JSON.</li>' +
+    '</ul></div>';
+
+  const memTop = Math.max.apply(null, runs.map(r => r.details_found));
+  const memWinners = runs.filter(r => r.details_found === memTop);
+  const tokTop = Math.min.apply(null, totals);
+  const tokWinners = runs.filter((r, i) => totals[i] === tokTop);
   let verdict = '<div class="verdict">';
-  verdict += memWinner
-    ? 'Деталей лучше помнит режим «' + esc(memWinner) + '» (' + Math.max(a.details_found, b.details_found) + ' из ' + a.details_total + '). '
-    : 'По деталям режимы равны (' + a.details_found + ' из ' + a.details_total + '). ';
-  verdict += tokWinner
-    ? 'Дешевле по токенам: «' + esc(tokWinner) + '» (' + num(Math.min(ta, tb)) + ' против ' + num(Math.max(ta, tb)) + ' ток. без учёта суммаризатора).'
-    : 'Расход токенов одинаков.';
+  verdict += memWinners.length === runs.length
+    ? 'По деталям режимы равны (' + memTop + ' из ' + dt + '). '
+    : 'Деталей лучше помнит режим «' + esc(memWinners[0].label) + '» (' + memTop + ' из ' + dt + '). ';
+  verdict += tokWinners.length === runs.length
+    ? 'Расход токенов одинаков.'
+    : 'Дешевле по токенам: «' + esc(tokWinners[0].label) + '» (' + num(tokTop) +
+      ' против ' + num(Math.max.apply(null, totals)) + ' ток. без учёта доп. вызовов).';
   verdict += '</div>';
   html += verdict;
 
@@ -396,9 +530,11 @@ expBtn.addEventListener('click', async () => {
   try {
     const s = await (await fetch('/api/experiment/state')).json();
     if (s.phase !== 'running') {
-      if (!confirm('Эксперимент очистит текущую историю диалога и прогонит один и тот же диалог ' +
-                   'в режимах «полная история» и «summary + 10 последних», затем задаст вопросы ' +
-                   'по деталям (пара минут). Запустить?')) {
+      if (!confirm('Эксперимент очистит текущую историю диалога, все ветки и чекпоинты ' +
+                   'и прогонит один и тот же диалог ' +
+                   'в трёх режимах — «summary + 10 последних», ' +
+                   '«sliding window (10 последних)» и «facts + 10 последних», — затем задаст ' +
+                   'вопросы по деталям (несколько минут). Запустить?')) {
         setExpUI(false);
         return;
       }
@@ -427,7 +563,7 @@ expBtn.addEventListener('click', async () => {
   } catch (e) {}
 })();
 
-loadHistory();
+loadBranches(false).then(loadHistory);
 
 document.getElementById('form').addEventListener('submit', (e) => { e.preventDefault(); run(); });
 </script>
@@ -440,6 +576,15 @@ def index():
     return render_template_string(HTML, model=MODELS[0])
 
 
+def _branch_id(value) -> int:
+    """Parse a branch id from a request; unknown values fall back to the root."""
+    try:
+        branch_id = int(value or store.ROOT_BRANCH_ID)
+    except (TypeError, ValueError):
+        return store.ROOT_BRANCH_ID
+    return branch_id if store.get_branch(branch_id) else store.ROOT_BRANCH_ID
+
+
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
     data = request.get_json(silent=True) or {}
@@ -447,11 +592,12 @@ def api_chat():
     if not message:
         return jsonify({"reply": None, "error": "Запрос не может быть пустым."}), 400
     context_mode = data.get("context_mode")
-    if context_mode not in ("full", "summary"):
-        context_mode = "full"
+    if context_mode not in ("summary", "window", "facts"):
+        context_mode = "summary"
+    branch_id = _branch_id(data.get("branch_id"))
     try:
         agent = Agent()
-        result = agent.ask(message, context_mode)
+        result = agent.ask(message, context_mode, branch_id)
         return jsonify({
             "reply": result["reply"],
             "tool_calls_used": result["tool_calls_used"],
@@ -467,8 +613,9 @@ def api_chat():
 
 @app.route("/api/history")
 def api_history():
+    branch_id = _branch_id(request.args.get("branch_id"))
     messages = [{"role": m["role"], "content": m["content"]}
-                for m in store.load_messages()
+                for m in store.load_messages(branch_id)
                 if m["role"] in ("user", "assistant") and m.get("content")]
     return jsonify({"messages": messages, "error": None})
 
@@ -477,6 +624,45 @@ def api_history():
 def api_clear():
     store.clear_history()
     return jsonify({"error": None})
+
+
+@app.route("/api/branches")
+def api_branches():
+    return jsonify({"branches": store.list_branches(), "error": None})
+
+
+@app.route("/api/checkpoint", methods=["POST"])
+def api_checkpoint():
+    """Save a checkpoint in a branch: the fork point for new branches."""
+    data = request.get_json(silent=True) or {}
+    branch_id = _branch_id(data.get("branch_id"))
+    count = len(store.load_messages(branch_id))
+    store.set_checkpoint(branch_id, count)
+    return jsonify({"branch_id": branch_id, "checkpoint_len": count, "error": None})
+
+
+@app.route("/api/branch/create", methods=["POST"])
+def api_branch_create():
+    """Fork a branch from the parent's checkpoint (or from its end)."""
+    data = request.get_json(silent=True) or {}
+    parent_id = _branch_id(data.get("from_branch_id"))
+    name = (data.get("name") or "").strip() or None
+    try:
+        branch = store.create_branch(parent_id, name)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"branch": branch, "branches": store.list_branches(), "error": None})
+
+
+@app.route("/api/branch/delete", methods=["POST"])
+def api_branch_delete():
+    data = request.get_json(silent=True) or {}
+    branch_id = _branch_id(data.get("branch_id"))
+    try:
+        store.delete_branch(branch_id)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"branches": store.list_branches(), "error": None})
 
 
 @app.route("/api/experiment/start", methods=["POST"])

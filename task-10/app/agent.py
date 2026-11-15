@@ -28,17 +28,20 @@ class Agent:
         self.model = model
         self.temperature = temperature
 
-    def ask(self, user_text: str, context_mode: str = "full") -> dict:
+    def ask(self, user_text: str, context_mode: str = "summary",
+            branch_id: int = store.ROOT_BRANCH_ID) -> dict:
         """Answer a user message, possibly using tools. Returns a result dict.
 
         The context sent to the LLM is built according to ``context_mode``
-        ("full" — the whole history, "summary" — rolling summary + recent
-        messages). The stored history always keeps every message: in summary
-        mode only the request is trimmed, the DB stays complete.
+        ("summary" — rolling summary + recent messages (default), "window" —
+        only the last KEEP messages, "facts" — sticky facts block + recent
+        messages), taken from the dialog of branch ``branch_id``. The stored
+        history always keeps every message: in trimmed modes only the request
+        is cut, the DB stays complete.
         """
-        self.messages, context_info = build_context(context_mode)
+        self.messages, context_info = build_context(context_mode, user_text, branch_id)
         history_tokens = count_messages(self.messages)
-        full_history = store.load_messages()
+        full_history = store.load_messages(branch_id)
         base_len = len(self.messages)  # everything past this is new this turn
         self.messages.append({"role": "user", "content": user_text})
         request_tokens = count_tokens(user_text)
@@ -71,7 +74,7 @@ class Agent:
             # No tool calls -> the model gave a final answer -> done.
             if not message.tool_calls:
                 self.messages.append({"role": "assistant", "content": message.content or ""})
-                store.save_messages(full_history + self.messages[base_len:])
+                store.save_messages(full_history + self.messages[base_len:], branch_id)
                 text = (message.content or "").strip()
                 return {
                     "reply": text,
@@ -115,7 +118,7 @@ class Agent:
             "role": "assistant",
             "content": "Агент перестал отвечать (превышен лимит шагов). Попробуйте переформулировать запрос.",
         })
-        store.save_messages(full_history + self.messages[base_len:])
+        store.save_messages(full_history + self.messages[base_len:], branch_id)
         return {
             "reply": "Агент перестал отвечать (превышен лимит шагов). Попробуйте переформулировать запрос.",
             "tool_calls_used": tool_calls_used,

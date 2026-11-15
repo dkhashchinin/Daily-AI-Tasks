@@ -1,11 +1,12 @@
 """A/B experiment: "Эксперимент с хранением контекста".
 
-The same scripted dialog (``app/experiment_script.json``) is played twice
-through the real agent — first in "полная история" mode, then in
-"summary + 10 последних" mode. After each dialog the detail questions from the
-same file are asked in the same mode; the stored expected answers are used
-only for grading. The report compares how many details were remembered and how
-many tokens each strategy spent.
+The same scripted dialog (``app/experiment_script.json``) is played once per
+strategy through the real agent — "summary + 10 последних",
+"sliding window (10 последних)" and "facts + 10 последних". After each dialog
+the detail questions from the same file are asked in the same mode; the stored
+expected answers are used only for grading. The report compares how many
+details each strategy remembered, how many tokens it spent and how much code /
+extra model calls its maintenance requires.
 
 The experiment runs step by step (one agent turn per :func:`step` call) so the
 web UI can show the dialog live. State is kept in memory; a page reload can
@@ -21,9 +22,33 @@ from .agent import Agent
 SCRIPT_PATH = Path(__file__).resolve().parent / "experiment_script.json"
 
 RUNS = [
-    {"mode": "full", "label": "полная история"},
     {"mode": "summary", "label": "summary + 10 последних"},
+    {"mode": "window", "label": "sliding window (10 последних)"},
+    {"mode": "facts", "label": "facts + 10 последних"},
 ]
+
+# Оценка стоимости поддержки каждой стратегии: сколько кода она добавляет
+# (стратегический код в app/context.py: системные промпты, обновление
+# состояния, ветка в build_context) и какие доп. LLM-вызовы порождает.
+# Фактическое число вызовов и их токены в отчёте берутся из замеров прогона
+# (extra_usage), поэтому строка кода здесь — приближение.
+MAINTENANCE = {
+    "summary": {
+        "code_lines": 90,
+        "code": "SUMMARY_SYSTEM + _transcript + update_summary + ветка в build_context",
+        "calls_note": "доп. вызов за ход, когда история длиннее окна",
+    },
+    "window": {
+        "code_lines": 5,
+        "code": "одна ветка в build_context (safe_window_start общий)",
+        "calls_note": "",
+    },
+    "facts": {
+        "code_lines": 80,
+        "code": "FACTS_SYSTEM + update_facts + _parse_facts + ветка в build_context",
+        "calls_note": "доп. вызов после каждого сообщения пользователя",
+    },
+}
 
 _state: dict = {"phase": "idle", "script": None, "runs": [], "report": None}
 
@@ -46,7 +71,7 @@ def _new_run(mode: str, label: str) -> dict:
         "api_prompt": 0,
         "api_completion": 0,
         "api_cost": 0.0,
-        "summary_usage": {"prompt": 0, "completion": 0, "cost": 0.0, "calls": 0},
+        "extra_usage": {"prompt": 0, "completion": 0, "cost": 0.0, "calls": 0},
     }
 
 
@@ -92,13 +117,15 @@ def _accumulate_usage(run: dict, tokens: dict, context_info: dict) -> None:
     run["api_prompt"] += tokens.get("prompt") or 0
     run["api_completion"] += tokens.get("completion") or 0
     run["api_cost"] += tokens.get("cost") or 0.0
-    su = (context_info or {}).get("summary_usage")
-    if su:
-        acc = run["summary_usage"]
-        acc["prompt"] += su.get("prompt") or 0
-        acc["completion"] += su.get("completion") or 0
-        acc["cost"] += su.get("cost") or 0.0
-        acc["calls"] += 1
+    ci = context_info or {}
+    for key in ("summary_usage", "facts_usage"):
+        su = ci.get(key)
+        if su:
+            acc = run["extra_usage"]
+            acc["prompt"] += su.get("prompt") or 0
+            acc["completion"] += su.get("completion") or 0
+            acc["cost"] += su.get("cost") or 0.0
+            acc["calls"] += 1
 
 
 def step() -> dict:
@@ -164,7 +191,7 @@ def step() -> dict:
                     _state["stage"] = "dialog"
                     _state["turn"] = 0
                     _state["runs"].append(_new_run(**nxt))
-                    store.clear_history()  # второй прогон — с чистого листа
+                    store.clear_history()  # следующий прогон — с чистого листа
                 else:
                     _state["phase"] = "done"
                     _state["report"] = _build_report()
@@ -194,13 +221,14 @@ def _build_report() -> dict:
             "questions_total": len(questions),
             "details_found": sum(q["facts_found"] for q in run["qa"]),
             "details_total": details_total,
+            "maintenance": MAINTENANCE.get(run["mode"], {}),
             "api": {
                 "prompt": run["api_prompt"],
                 "completion": run["api_completion"],
                 "cost": round(run["api_cost"], 4),
             },
-            "summary_usage": {k: (round(v, 4) if isinstance(v, float) else v)
-                              for k, v in run["summary_usage"].items()},
+            "extra_usage": {k: (round(v, 4) if isinstance(v, float) else v)
+                            for k, v in run["extra_usage"].items()},
             "avg_context_tokens": round(sum(hist) / len(hist)),
             "avg_dialog_context_tokens": round(sum(dialog_hist) / len(dialog_hist)),
             "qa": run["qa"],

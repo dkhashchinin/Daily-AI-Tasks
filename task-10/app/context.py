@@ -1,13 +1,21 @@
 """Context management strategies ("Управление контекстом").
 
-Two modes:
-- "full"    — the whole stored history is sent to the LLM as-is;
+Three modes ("summary" is the default):
 - "summary" — everything older than the last KEEP messages is replaced by a
   rolling summary. The summary is stored separately (SQLite table
   ``context_state``) and substituted into the request as a system message
   instead of the full history. Only the last KEEP messages ever go "as is":
   as soon as messages fall out of the window they are folded into the summary.
+- "window"  — sliding window: only the last KEEP messages are sent to the LLM,
+  everything older is simply dropped from the request (the DB still keeps the
+  whole history).
+- "facts"   — sticky facts / key-value memory: a separate JSON block "facts"
+  stores the important details of the dialog (goal, constraints, preferences,
+  decisions, agreements). It is refreshed after every user message and sent
+  as a system message, followed by the last KEEP messages "as is".
 """
+import json
+
 from . import store
 from .llm import chat
 from .tokens import count_tokens
@@ -18,6 +26,14 @@ SUMMARY_SYSTEM = (
     "Ты ведёшь краткую сводку диалога. Суммируй переписку, сохраняя важные "
     "факты, имена, числа, договорённости и незавершённые задачи. "
     "В ответе — только сама сводка, без вступлений и комментариев."
+)
+
+FACTS_SYSTEM = (
+    "Ты ведёшь блок «факты» диалога в формате JSON (ключ -> значение). "
+    "Храни только важное: цель, ограничения, предпочтения, решения, "
+    "договорённости, имена, числа, даты. Ничего не выдумывай. Обнови блок "
+    "с учётом нового сообщения пользователя: добавь новое, исправь "
+    "устаревшее, удали неактуальное. В ответе — только JSON без пояснений."
 )
 
 
@@ -56,21 +72,30 @@ def _transcript(messages: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def update_summary() -> tuple[str | None, int, dict | None]:
+def _usage_dict(usage) -> dict:
+    """Extract token usage of an auxiliary LLM call (summarizer / facts)."""
+    return {
+        "prompt": getattr(usage, "prompt_tokens", 0) or 0 if usage else 0,
+        "completion": getattr(usage, "completion_tokens", 0) or 0 if usage else 0,
+        "cost": float(getattr(usage, "cost", 0) or 0) if usage else 0.0,
+    }
+
+
+def update_summary(branch_id: int = store.ROOT_BRANCH_ID) -> tuple[str | None, int, dict | None]:
     """Fold messages that fell out of the window into the stored summary.
 
-    Returns ``(summary, covered, usage)`` where ``covered`` is how many oldest
-    messages the summary already replaces and ``usage`` is the summarizer's
-    token usage (or None). On summarizer failure the previous state is kept,
-    so the agent keeps working.
+    The summary is kept per branch. Returns ``(summary, covered, usage)``
+    where ``covered`` is how many oldest messages the summary already replaces
+    and ``usage`` is the summarizer's token usage (or None). On summarizer
+    failure the previous state is kept, so the agent keeps working.
     """
-    messages = store.load_messages()
-    summary, covered = store.load_summary()
+    messages = store.load_messages(branch_id)
+    summary, covered = store.load_summary(branch_id)
     window = safe_window_start(messages)
 
     if covered > window:  # defensive: never claim more than exists
         covered = window
-        store.save_summary(summary, covered)
+        store.save_summary(summary, covered, branch_id)
         return summary, covered, None
 
     # Any message older than the window that is not covered by the summary yet
@@ -100,27 +125,107 @@ def update_summary() -> tuple[str | None, int, dict | None]:
 
     if not new_summary:
         return summary, covered, None
-    store.save_summary(new_summary, window)
-    usage = getattr(response, "usage", None)
-    return new_summary, window, {
-        "prompt": getattr(usage, "prompt_tokens", 0) or 0 if usage else 0,
-        "completion": getattr(usage, "completion_tokens", 0) or 0 if usage else 0,
-        "cost": float(getattr(usage, "cost", 0) or 0) if usage else 0.0,
-    }
+    store.save_summary(new_summary, window, branch_id)
+    return new_summary, window, _usage_dict(getattr(response, "usage", None))
 
 
-def build_context(mode: str) -> tuple[list[dict], dict]:
-    """Build the message list to send to the LLM for the given mode.
+def _parse_facts(raw: str | None) -> dict | None:
+    """Parse the updater's reply into a facts dict (tolerates ``` fences)."""
+    if not raw:
+        return None
+    text = raw.strip()
+    if text.startswith("```"):
+        first_nl = text.find("\n")
+        if first_nl != -1:
+            text = text[first_nl + 1:]
+        text = text.rstrip()
+        if text.endswith("```"):
+            text = text[:-3].rstrip()
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        parsed = json.loads(text[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def update_facts(user_text: str,
+                 branch_id: int = store.ROOT_BRANCH_ID) -> tuple[dict, dict | None]:
+    """Merge new information from the user message into the sticky facts.
+
+    The facts block is kept per branch. Returns ``(facts, usage)``. On updater
+    failure the previous facts are kept unchanged, so the agent keeps working.
+    """
+    facts = store.load_facts(branch_id)
+    parts = ["Текущие факты (JSON; может быть пустым):",
+             json.dumps(facts, ensure_ascii=False) if facts else "{}",
+             "Новое сообщение пользователя:", user_text,
+             "Верни обновлённый блок фактов в формате JSON."]
+
+    try:
+        response = chat(
+            [
+                {"role": "system", "content": FACTS_SYSTEM},
+                {"role": "user", "content": "\n\n".join(parts)},
+            ],
+        )
+        raw = (response.choices[0].message.content or "").strip()
+    except Exception as exc:
+        print(f"[context] не удалось обновить facts: {exc}")
+        return facts, None
+
+    new_facts = _parse_facts(raw)
+    if new_facts is None:  # updater replied garbage — keep the old block
+        print("[context] facts: не удалось разобрать JSON ответа, блок не изменён")
+        return facts, None
+    store.save_facts(new_facts, branch_id)
+    return new_facts, _usage_dict(getattr(response, "usage", None))
+
+
+def build_context(mode: str, new_user_text: str | None = None,
+                  branch_id: int = store.ROOT_BRANCH_ID) -> tuple[list[dict], dict]:
+    """Build the message list to send to the LLM for the given branch/mode.
 
     Returns ``(context_messages, info)``. In "summary" mode it is a system
     message with the summary (if any) followed by the recent messages kept
-    as is.
+    as is. In "window" mode it is only the last KEEP messages. In "facts"
+    mode the sticky facts block is refreshed with ``new_user_text`` first
+    and sent as a system message before the last KEEP messages. Summary and
+    facts state is per branch.
     """
-    messages = store.load_messages()
-    if mode != "summary":
-        return messages, {"mode": "full", "summary_used": False}
+    messages = store.load_messages(branch_id)
 
-    summary, covered, summary_usage = update_summary()
+    if mode == "window":
+        start = safe_window_start(messages)
+        context = messages[start:]
+        return context, {"mode": "window", "as_is": len(context)}
+
+    if mode == "facts":
+        if new_user_text:
+            facts, facts_usage = update_facts(new_user_text, branch_id)
+        else:  # no new message — send the stored block as is
+            facts, facts_usage = store.load_facts(branch_id), None
+        start = safe_window_start(messages)
+        context: list[dict] = []
+        if facts:
+            context.append({
+                "role": "system",
+                "content": "Важные факты диалога (ключ -> значение):\n"
+                           + json.dumps(facts, ensure_ascii=False, indent=2),
+            })
+        context.extend(messages[start:])
+        return context, {
+            "mode": "facts",
+            "facts_used": bool(facts),
+            "facts_tokens": count_tokens(json.dumps(facts, ensure_ascii=False)) if facts else 0,
+            "as_is": len(messages) - start,
+            "facts_usage": facts_usage,
+        }
+
+    # "summary" (режим по умолчанию; неизвестный режим тоже попадает сюда)
+    summary, covered, summary_usage = update_summary(branch_id)
     context: list[dict] = []
     if summary:
         context.append({
