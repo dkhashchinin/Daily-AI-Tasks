@@ -106,8 +106,9 @@ def init_db() -> None:
             """
         )
         # Long-term memory (LTM): profile, decisions and knowledge that survive
-        # dialog reset and branches. Each entry has a category and the source
-        # it came from ('experiment' seeds it from the experiment's facts).
+        # dialog reset and branches. Each entry has a category and a source
+        # ('manual' for hand-added entries, 'dialog' for profile rules learned
+        # from the dialog).
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS long_term_memory (
@@ -755,42 +756,6 @@ def replace_dialog_rules(profile_id: int, rules: list[dict]) -> None:
             )
 
 
-def snapshot_profiles() -> dict:
-    """Full dump of the profiles + profile_rules tables (for the experiment)."""
-    init_db()
-    with _connect() as conn:
-        profiles = [dict(r) for r in conn.execute(
-            "SELECT id, name, description, is_active, created_at FROM profiles ORDER BY id"
-        ).fetchall()]
-        rules = [dict(r) for r in conn.execute(
-            "SELECT id, profile_id, kind, text, source, updated_at"
-            " FROM profile_rules ORDER BY id"
-        ).fetchall()]
-    return {"profiles": profiles, "rules": rules}
-
-
-def restore_profiles(snap: dict) -> None:
-    """Put the profiles tables back exactly as captured by
-    :func:`snapshot_profiles` (ids included)."""
-    init_db()
-    with _connect() as conn:
-        conn.execute("DELETE FROM profile_rules")
-        conn.execute("DELETE FROM profiles")
-        for p in snap.get("profiles", []):
-            conn.execute(
-                "INSERT INTO profiles (id, name, description, is_active, created_at)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (p["id"], p["name"], p["description"], p["is_active"], p["created_at"]),
-            )
-        for r in snap.get("rules", []):
-            conn.execute(
-                "INSERT INTO profile_rules (id, profile_id, kind, text, source, updated_at)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
-                (r["id"], r["profile_id"], r["kind"], r["text"], r["source"],
-                 r["updated_at"]),
-            )
-
-
 # --- Invariants (rules the assistant must not violate) -------------------------
 
 
@@ -894,7 +859,7 @@ def list_invariant_log(limit: int = 100) -> list[dict]:
 
 
 def snapshot_invariants() -> dict:
-    """Full dump of the invariants + invariant_log tables (for experiments)."""
+    """Full dump of the invariants + invariant_log tables (for tests and backups)."""
     init_db()
     with _connect() as conn:
         invariants = [dict(r) for r in conn.execute(

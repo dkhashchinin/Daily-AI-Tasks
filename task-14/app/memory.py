@@ -15,8 +15,7 @@ own SQLite table (separate storage) and promoted explicitly:
 **LTM  — долговременная (профиль, решения, знания)**
     `app/store.py` ``long_term_memory`` table (global). Reusable facts that
     outlive a single dialog: who the user/company is, standing decisions,
-    domain knowledge. Survives dialog reset and branches. Seeded from the
-    experiment facts (``source="experiment"``).
+    domain knowledge. Survives dialog reset and branches.
 
 What goes into the prompt — one rule per layer (``PROMPT_RULES``), enforced in
 :func:`app.context.build_context`:
@@ -29,7 +28,6 @@ What goes into the prompt — one rule per layer (``PROMPT_RULES``), enforced in
 Explicit saving — what goes where is chosen, not automatic:
 - dialog → WM: :func:`context.update_facts` (extract on each user turn);
 - WM → LTM: :func:`promote_working` (pick keys / category, or the UI button);
-- experiment → LTM: :func:`seed_from_experiment` (the experiment's facts);
 - manual: :func:`save_long_term`.
 """
 from . import store
@@ -149,18 +147,3 @@ def save_long_term(category: str, key: str, value: str) -> int:
     if not key or not value:
         raise ValueError("Ключ и значение не могут быть пустыми.")
     return store.add_long_term(category, key, value, source="manual")
-
-
-def seed_from_experiment(facts: dict) -> int:
-    """Make the experiment's facts the basis of long-term memory.
-
-    Replaces any previously experiment-seeded entries and stores each fact of
-    the experiment's facts block with ``source="experiment"``. Returns the
-    number of entries written.
-    """
-    store.clear_long_term(source="experiment")
-    added = 0
-    for key, value in (facts or {}).items():
-        store.add_long_term(_classify(key, value), key, value, source="experiment")
-        added += 1
-    return added
