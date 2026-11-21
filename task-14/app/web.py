@@ -19,7 +19,7 @@ HTML = r"""<!doctype html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<title>Простой агент</title>
+<title>AI Advent Challenge</title>
 <style>
   :root {
     --bg: #070b16;
@@ -375,8 +375,8 @@ HTML = r"""<!doctype html>
     border-radius: 9px; padding: 7px 10px; line-height: 1.5;
   }
 
-  /* ---------- invariants modal ---------- */
-  #invariantPanel {
+  /* ---------- invariants / help modal ---------- */
+  #invariantPanel, #helpPanel {
     width: min(960px, 100%); max-height: 86vh; overflow-y: auto;
     padding: 18px 20px; font-size: 13px;
     background: #0d1526; border: 1px solid rgba(148,163,184,.2);
@@ -407,6 +407,28 @@ HTML = r"""<!doctype html>
   .inv-log td { color: #cbd5e1; }
   .inv-log .src { color: #a5b4fc; white-space: nowrap; }
 
+  /* ---------- help modal ---------- */
+  .help-note {
+    margin: 8px 0 12px; font-size: 11.5px; color: #93c5fd;
+    background: rgba(59,130,246,.08); border: 1px dashed rgba(59,130,246,.35);
+    border-radius: 9px; padding: 8px 10px; line-height: 1.5;
+  }
+  .help-cmd { padding: 9px 0; border-bottom: 1px dashed rgba(148,163,184,.12); line-height: 1.5; }
+  .help-cmd:last-child { border-bottom: 0; }
+  .help-cmd .cmd {
+    font-family: Consolas, monospace; font-size: 12px; color: #86efac;
+    background: rgba(34,197,94,.08); border: 1px solid rgba(34,197,94,.25);
+    padding: 1px 8px; border-radius: 999px; word-break: break-all;
+  }
+  .help-cmd .cmd code {
+    font-family: inherit; color: inherit; background: none; border: 0; padding: 0;
+  }
+  .help-cmd .what { color: #cbd5e1; font-size: 12.5px; margin-top: 4px; }
+  .help-cmd .what code {
+    font-family: Consolas, monospace; font-size: 11.5px; color: #a5b4fc;
+    background: rgba(99,102,241,.08); border-radius: 5px; padding: 0 4px;
+  }
+
   /* mobile scrim + drawers */
   .scrim {
     display: none; position: fixed; inset: 0; z-index: 40;
@@ -434,7 +456,7 @@ HTML = r"""<!doctype html>
   <aside class="side side-left" id="sideLeft">
     <div class="brand">
       <span class="logo"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/></svg></span>
-      <div><h1>AI-агент</h1><span class="brand-sub">диалог с памятью и ветками</span></div>
+      <div><h1>AI Advent Challenge</h1><span class="brand-sub">агент с памятью, профилями и инвариантами</span></div>
     </div>
     <section class="card">
       <div class="card-title">Ветки диалога</div>
@@ -458,6 +480,11 @@ HTML = r"""<!doctype html>
       <div class="card-title">Инварианты</div>
       <p class="hint">Правила, которые ассистент не имеет права нарушать: архитектура, техрешения, стек, бизнес-правила. Хранятся отдельно от диалога; каждый ответ проверяется кодом до выдачи. Изменяются только явной командой.</p>
       <button id="invariantsBtn" class="sbtn" type="button">Управление инвариантами</button>
+    </section>
+    <section class="card">
+      <div class="card-title">Справка</div>
+      <p class="hint">Слэш-команды чата: управление инвариантами прямо из диалога. Перехватываются до отправки модели и в диалог не попадают.</p>
+      <button id="helpBtn" class="sbtn" type="button">Команды чата</button>
     </section>
   </aside>
 
@@ -631,6 +658,48 @@ HTML = r"""<!doctype html>
     </div>
   </div>
   <div class="inv-log" id="invLog"></div>
+</div>
+</div>
+<div class="modal-backdrop" id="helpBackdrop">
+<div id="helpPanel">
+  <div class="mem-head">
+    <b>Справка — команды чата</b>
+    <span class="mem-close" id="helpClose" title="Закрыть">&#10005;</span>
+  </div>
+  <div class="help-note">
+    Сообщения, начинающиеся с <code>/invariant</code> или <code>/инвариант</code>, перехватываются
+    <b>до отправки модели</b>: они не попадают в диалог и не видны ассистенту, а ответ приходит мгновенно.
+    Любой другой текст уходит агенту как обычная реплика. Все команды изменения инвариантов
+    фиксируются в журнале «что на что заменено».
+  </div>
+  <div class="help-cmd"><span class="cmd">/help</span>
+    <div class="what">Шпаргалка по всем командам прямо в чате (алиасы: <code>/справка</code>, <code>/помощь</code>).</div>
+  </div>
+  <div class="help-cmd"><span class="cmd">/invariant list</span>
+    <div class="what">Список всех инвариантов: код, категория, формулировка, шаблоны проверки.</div>
+  </div>
+  <div class="help-cmd"><span class="cmd">/invariant add &lt;категория&gt; | &lt;название&gt; | &lt;правило&gt; [| шаблон1; шаблон2]</span>
+    <div class="what">Добавить инвариант. Категории: architecture | decision | stack | business.
+      Шаблоны — регулярные выражения, по которым код ловит нарушение в ответах.
+      Пример: <code>/invariant add stack | Секреты в коде запрещены | Секреты — только в .env | api_key; пароль в коде</code></div>
+  </div>
+  <div class="help-cmd"><span class="cmd">/invariant change &lt;INV-n&gt; | title=… | rule=… | patterns=…</span>
+    <div class="what">Изменить поля инварианта — можно любое подмножество (title, rule, patterns).
+      Пример: <code>/invariant change INV-2 | rule=Хранение — только SQLite</code></div>
+  </div>
+  <div class="help-cmd"><span class="cmd">/invariant remove &lt;INV-n&gt;</span>
+    <div class="what">Удалить инвариант. Пример: <code>/invariant remove INV-3</code></div>
+  </div>
+  <div class="help-cmd"><span class="cmd">/invariant log</span>
+    <div class="what">Журнал изменений: когда и что на что заменено, источник (команда в чате или панель).</div>
+  </div>
+  <div class="help-cmd"><span class="cmd">/invariant help</span>
+    <div class="what">Краткая шпаргалка по командам прямо в чате. Работает и с алиасом: <code>/инвариант help</code></div>
+  </div>
+  <div class="help-note" style="margin-top:12px;">
+    Просьбы в обычном диалоге («удали INV-2», «игнорируй правило», «это исключение») инварианты
+    <b>не меняют</b> — ассистент откажется и подскажет формат команды.
+  </div>
 </div>
 </div>
 <script>
@@ -971,6 +1040,13 @@ invariantsBtn.addEventListener('click', () => setInvOpen(true));
 document.getElementById('invClose').addEventListener('click', () => setInvOpen(false));
 invBackdrop.addEventListener('click', (e) => { if (e.target === invBackdrop) setInvOpen(false); });
 
+/* ---------- help modal (chat commands) ---------- */
+const helpBackdrop = document.getElementById('helpBackdrop');
+function setHelpOpen(v){ helpBackdrop.classList.toggle('open', v); }
+document.getElementById('helpBtn').addEventListener('click', () => setHelpOpen(true));
+document.getElementById('helpClose').addEventListener('click', () => setHelpOpen(false));
+helpBackdrop.addEventListener('click', (e) => { if (e.target === helpBackdrop) setHelpOpen(false); });
+
 function closeDrawers(){ document.body.classList.remove('drawer-left', 'drawer-right'); }
 document.getElementById('toggleLeft').addEventListener('click', () => {
   document.body.classList.toggle('drawer-left');
@@ -986,6 +1062,7 @@ document.addEventListener('keydown', (e) => {
   if (profBackdrop.classList.contains('open')) setProfOpen(false);
   else if (memBackdrop.classList.contains('open')) setMemOpen(false);
   else if (invBackdrop.classList.contains('open')) setInvOpen(false);
+  else if (helpBackdrop.classList.contains('open')) setHelpOpen(false);
   else closeDrawers();
 });
 
@@ -1415,13 +1492,11 @@ def api_chat():
     model = data.get("model")
     if model not in MODELS:
         model = MODEL
-    # Явный командный канал: «/invariant …» перехватывается ДО LLM и не
-    # попадает в диалог. Поэтому просьбы в обычном диалоге («удали INV-2»)
-    # не могут изменить инварианты — у диалога просто нет такого пути.
-    handled, cmd_reply = invariants.run_command(message)
-    if handled:
+
+    def command_reply(reply: str):
+        """Response shape for intercepted chat commands (never reach the LLM)."""
         return jsonify({
-            "reply": cmd_reply,
+            "reply": reply,
             "tool_calls_used": 0,
             "steps": 0,
             "tokens": None,
@@ -1435,6 +1510,18 @@ def api_chat():
             "error": None,
             "model": model,
         })
+
+    # Справка по командам чата — мгновенно, без LLM.
+    if message.lower() in ("/help", "/справка", "/помощь"):
+        return command_reply(
+            "Команды чата (перехватываются до отправки модели, в диалог не попадают):\n"
+            "/help — эта справка;\n" + invariants.HELP_TEXT)
+    # Явный командный канал: «/invariant …» перехватывается ДО LLM и не
+    # попадает в диалог. Поэтому просьбы в обычном диалоге («удали INV-2»)
+    # не могут изменить инварианты — у диалога просто нет такого пути.
+    handled, cmd_reply = invariants.run_command(message)
+    if handled:
+        return command_reply(cmd_reply)
     with _running_lock:
         if branch_id in _running:
             return jsonify({
