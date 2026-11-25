@@ -1,0 +1,5 @@
+openai
+flask
+python-dotenv
+mcp
+atomno-mcp-cbr-rates
