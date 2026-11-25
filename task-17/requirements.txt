@@ -1,0 +1,8 @@
+openai
+flask
+python-dotenv
+mcp
+atomno-mcp-cbr-rates
+grpcio
+grpcio-tools
+protobuf
